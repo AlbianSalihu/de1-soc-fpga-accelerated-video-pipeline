@@ -1,0 +1,9 @@
+# ML dataset
+ml/data
+ml/data/**
+
+# Training artifacts
+ml/checkpoints/
+ml/runs/
+ml/outputs/
+!ml/outputs/exported/

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple
 
 import torch 
 from torch.utils.data import DataLoader, random_split
@@ -47,7 +47,7 @@ def _build_transform(image_size: int, normalize: bool, augment: bool):
             transforms.Resize((image_size, image_size)),
             transforms.RandomAffine(
                 degrees=10,
-                translate=(0.1, 0,1),
+                translate=(0.1, 0.1),
                 scale=(0.9, 1.1),
                 fill=0,
             ),

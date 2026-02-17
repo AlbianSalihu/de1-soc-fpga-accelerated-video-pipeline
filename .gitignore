@@ -1,3 +1,12 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual envs
+.venv/
+venv/
+env/
+
 # ML dataset
 ml/data
 ml/data/**

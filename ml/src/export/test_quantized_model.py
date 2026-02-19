@@ -1,0 +1,437 @@
+# Quantized inference verification script for AlexNet64Gray
+# This compares the results between quantized and unquantized 
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Dict, Any, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ml.src.data.mnist64 import MNIST64Config, get_dataloaders
+from ml.src.models.alexnet64gray import AlexNet64Gray
+
+def clamp_int(x: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+    return torch.clamp(x, lo, hi)
+
+
+def rounding_right_shift(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """Arithmetic right shift with sign-aware rounding. 
+
+    We want (x/2^r) rounded to nearest, but done in integer math.
+    For positive values:
+       (x + 2^(r-1)) >> r
+    For negative values:
+       -(((-x) + 2^(r-1))>>r)
+
+    Args:
+        x (torch.Tensor): int64 tensor
+        r (torch.Tensor): int tensor broadcastable to x 
+
+    Returns:
+        torch.Tensor: int64 tensor after rounding and shifting
+    """
+    r = r.to(dtype=torch.int64)
+
+    add = (1 << (r - 1))
+    pos = (x >= 0)
+    x_pos = (x + add) >> r
+    x_neg = -(((-x) + add) >> r)
+    return torch.where(pos, x_pos, x_neg)
+
+
+def requant_u8_from_acc(
+    acc: torch.Tensor,
+    m: torch.Tensor,
+    r: torch.Tensor,
+) -> torch.Tensor:
+    """Requantize int accumulator into uint8 activation (post-ReLU)
+
+    Given per channel parameters (m[c], r[c]) approximating:
+       M_c = (s_x * s_w[c]) / s_y = m[c] / 2^r[c]
+
+    Compute:
+       q_y = round(acc * m / 2^r)
+    Then Clamp into [0,255] (uint8), consistent with post-ReLU activations and z=0
+
+    Args:
+        acc (torch.Tensor): int64 tensor [N, C, H, W] (conv) or [N, C] (linear)
+        m (torch.Tensor): int32 tensor [C]
+        r (torch.Tensor): int32 tensor [C]
+
+    Returns:
+        torch.Tensor: uint8 tensor same shape as acc, values in [0,255]
+    """
+    m64 = m.to(dtype=torch.int64)
+    r64 = r.to(dtype=torch.int64)
+
+    if acc.dim() == 4:
+        m64 = m64.view(1, -1, 1, 1)
+        r64 = r64.view(1, -1, 1, 1)
+    elif acc.dim() == 2:
+        m64 = m64.view(1, -1)
+        r64 = r64.view(1, -1)
+    else:
+        raise ValueError(f"Unsupported acc dim {acc.dim()}")
+
+    prod = acc * m64  # int64
+    # right shift with rounding
+    out = rounding_right_shift(prod, r64)
+    out = clamp_int(out, 0, 255).to(torch.uint8)
+    return out
+
+
+def conv2d_int_acc(
+    x_u8_or_i8: torch.Tensor,
+    w_i8: torch.Tensor,
+    b_i32: torch.Tensor | None,
+    stride: Tuple[int, int],
+    padding: Tuple[int, int],
+) -> torch.Tensor:
+    """Compute conv2d accumulator exactly (integer domain)
+
+     acc = conv2d(x,w) + b
+
+    Args:
+        x_u8_or_i8 (torch.Tensor): [N, C, H, W] uint8 or int8 activations
+        w_i8 (torch.Tensor): [O, C, KH, KW] int8 weights
+        b_i32 (torch.Tensor | None): int32 bias accumulator units, or None
+        stride (Tuple[int, int]): conv stride
+        padding (Tuple[int, int]): conv padding
+
+    Returns:
+        torch.Tensor: int64 accumulator tensor [N, O, H', W']
+    """
+    # Use float64 conv for exact integer sums (avoid float32 overflow/rounding).
+    x64 = x_u8_or_i8.to(torch.int32).to(torch.float64)
+    w64 = w_i8.to(torch.int32).to(torch.float64)
+
+    y64 = F.conv2d(x64, w64, bias=None, stride=stride, padding=padding)
+    # y64 is exact integer in float64; convert to int64
+    acc = torch.round(y64).to(torch.int64)
+
+    if b_i32 is not None:
+        b64 = b_i32.to(torch.int64).view(1, -1, 1, 1)
+        acc = acc + b64
+    return acc
+
+
+def linear_int_acc(
+    x_u8_or_i8: torch.Tensor,
+    w_i8: torch.Tensor,
+    b_i32: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute linear accumulator exactly (integer domain).
+
+    acc = x @ w^T + b
+
+    Args:
+        x_u8_or_i8 (torch.Tensor): [N, I] uint8 or int8
+        w_i8 (torch.Tensor): [O, I] int8
+        b_i32 (torch.Tensor | None): [O] int32 or None
+
+    Returns:
+        torch.Tensor: int64 tensor [N, O]
+    """
+    x64 = x_u8_or_i8.to(torch.int32).to(torch.float64)
+    w64 = w_i8.to(torch.int32).to(torch.float64)
+
+    y64 = x64 @ w64.t()
+    acc = torch.round(y64).to(torch.int64)
+    if b_i32 is not None:
+        acc = acc + b_i32.to(torch.int64).view(1, -1)
+    return acc
+
+class QParams:
+    """Loads exported quantization parameters and exposes per-layer tensors.
+
+    The exporter produces:
+        - .npz: arrays (int8 weights, int32 bias, int32 m/r, and optional debug scales)
+        - .json: manifest describing layers and which arrays correspond to which layer
+
+    The class provides:
+        - name -> exported array keys
+        - tensors moved to correct device
+        - scale metadata s_x and s_y from manifest
+    """
+    def __init__(self, npz_path: Path, meta_path: Path, device: torch.device):
+        self.device = device
+        self.arr = np.load(npz_path)
+        self.meta = json.loads(meta_path.read_text())
+
+        # Map module name -> keys
+        self.layer_meta: Dict[str, Dict[str, Any]] = {}
+        for entry in self.meta["layers"]:
+            self.layer_meta[entry["name"]] = entry
+
+    def get_layer_tensors(self, layer_name: str):
+        """
+        Returns:
+            _type_: (W, B, m, r, s_w_debug, entry) for a layer
+        """
+        entry = self.layer_meta[layer_name]
+        keys = entry["export_keys"]
+
+        W = torch.from_numpy(self.arr[keys["W_q"]]).to(self.device)  # int8
+        B = None
+        if keys.get("B_q"):
+            B = torch.from_numpy(self.arr[keys["B_q"]]).to(self.device)  # int32
+
+        m = r = None
+        if keys.get("m") and keys.get("r"):
+            m = torch.from_numpy(self.arr[keys["m"]]).to(self.device)  # int32
+            r = torch.from_numpy(self.arr[keys["r"]]).to(self.device)  # int32
+
+        # For last layer logits argmax, need s_w (debug array)
+        s_w = None
+        if keys.get("s_w_debug"):
+            s_w = torch.from_numpy(self.arr[keys["s_w_debug"]]).to(self.device)  # float32
+
+        return W, B, m, r, s_w, entry
+
+    def sx_for_layer(self, layer_name: str) -> float:
+        return float(self.layer_meta[layer_name]["s_x"])
+
+    def sy_for_layer(self, layer_name: str) -> float | None:
+        v = self.layer_meta[layer_name]["s_y"]
+        return None if v is None else float(v)
+
+
+@torch.no_grad()
+def forward_quantized(
+    model: AlexNet64Gray,
+    qp: QParams,
+    x0_q: torch.Tensor,
+) -> torch.Tensor:
+    """Run quantized inference following the PQT design.
+
+    Args:
+        model (AlexNet64Gray): Architecture instance 
+        qp (QParams): Quantization params loaded from export 
+        x0_q (torch.Tensor): Quantized input tensor int8 [N, 1, 64, 64]
+
+    Returns:
+        torch.Tensor: Float logits for argmax comparison
+    """
+    x = x0_q  # int8 [N,1,64,64] initially
+
+    assert isinstance(model.features, nn.Sequential)
+    for i, mod in enumerate(model.features):
+        name = f"features.{i}"
+        if isinstance(mod, nn.Conv2d):
+            W, B, m, r, _s_w, entry = qp.get_layer_tensors(name)
+            acc = conv2d_int_acc(
+                x_u8_or_i8=x,
+                w_i8=W,
+                b_i32=B,
+                stride=mod.stride,
+                padding=mod.padding,
+            )
+            # ReLU on accumulator
+            acc = torch.clamp(acc, min=0)
+
+            if m is None or r is None:
+                raise RuntimeError(f"Missing m/r for {name} (expected post-ReLU quantized layer).")
+            x = requant_u8_from_acc(acc, m=m, r=r)  # uint8
+
+        elif isinstance(mod, nn.ReLU):
+            # Already applied ReLU in acc domain; skip
+            continue
+
+        elif isinstance(mod, nn.MaxPool2d):
+            # Pool operates on uint8 activations (comparison). Use int32 for F.max_pool2d.
+            x_pool = x.to(torch.int32)
+            x_pool = F.max_pool2d(
+                x_pool,
+                kernel_size=mod.kernel_size,
+                stride=mod.stride,
+                padding=mod.padding,
+                dilation=mod.dilation,
+                ceil_mode=mod.ceil_mode,
+            )
+            x = x_pool.to(torch.uint8)
+
+        else:
+            # If your AlexNet has other ops (e.g., AdaptiveAvgPool), add here.
+            raise NotImplementedError(f"Unsupported module in features: {name} -> {mod.__class__.__name__}")
+
+    # Flatten
+    x = torch.flatten(x, 1)  # [N, I] uint8
+
+    assert isinstance(model.classifier, nn.Sequential)
+    last_linear_name = None
+    for i, mod in enumerate(model.classifier):
+        if isinstance(mod, nn.Linear):
+            last_linear_name = f"classifier.{i}"
+
+    logits_float = None
+
+    for i, mod in enumerate(model.classifier):
+        name = f"classifier.{i}"
+
+        if isinstance(mod, nn.Flatten):
+            # Some models include Flatten as the first classifier op
+            x = torch.flatten(x, 1)
+            continue
+
+        if isinstance(mod, nn.Linear):
+            W, B, m, r, s_w, entry = qp.get_layer_tensors(name)
+            acc = linear_int_acc(x_u8_or_i8=x, w_i8=W, b_i32=B)
+
+            if name == last_linear_name:
+                # Last layer: no ReLU, no requant in our export.
+                s_x = qp.sx_for_layer(name)
+                if s_w is None:
+                    raise RuntimeError(f"Missing s_w_debug for last layer {name}; needed for logits scaling.")
+                scale = (s_w.to(torch.float64) * float(s_x)).view(1, -1)
+                logits_float = acc.to(torch.float64) * scale
+                break
+
+            # Hidden FC: apply ReLU then requant to uint8
+            acc = torch.clamp(acc, min=0)
+            if m is None or r is None:
+                raise RuntimeError(f"Missing m/r for {name} (expected post-ReLU quantized layer).")
+            x = requant_u8_from_acc(acc, m=m, r=r)  # uint8
+            continue
+
+        if isinstance(mod, nn.ReLU):
+            continue
+
+        if isinstance(mod, nn.Dropout):
+            continue
+
+        raise NotImplementedError(f"Unsupported module in classifier: {name} -> {mod.__class__.__name__}")
+
+    if logits_float is None:
+        raise RuntimeError("Failed to produce logits from quantized forward (did not hit last linear).")
+    return logits_float
+
+def quantize_input_from_normalized(x_norm: torch.Tensor, s0: float) -> torch.Tensor:
+    """Quantize already normalized float input into int8 for the first layer
+
+    q_0 = round(x_norm / s0), clamped to [-128, 127] as int8
+
+    Args:
+        x_norm (torch.Tensor): float input [N, 1, 64, 64]
+        s0 (float): first layer activation scale
+
+    Returns:
+        torch.Tensor: int8 tensor
+    """
+    q = torch.round(x_norm / float(s0))
+    q = torch.clamp(q, -128, 127).to(torch.int8)
+    return q
+
+@torch.no_grad()
+def evaluate_float(model: nn.Module, loader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / total
+
+
+@torch.no_grad()
+def evaluate_quantized(model: AlexNet64Gray, qp: QParams, loader, device: torch.device, s0: float) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        # x is normalized float because your cfg.normalize is True (same as training)
+        x0_q = quantize_input_from_normalized(x, s0=s0)  # int8
+
+        logits = forward_quantized(model, qp, x0_q=x0_q)  # float64 logits
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / total
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for quantized verification."""
+    p = argparse.ArgumentParser(description="Test quantized AlexNet64Gray using exported qparams.")
+    p.add_argument("--data-dir", type=str, default="ml/data")
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--val-ratio", type=float, default=0.1)
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--no-normalize", action="store_true", help="Disable dataset normalization (normally keep OFF for this test).")
+    p.add_argument("--augment", action="store_true", help="Enable augmentation (keep OFF for eval).")
+
+    p.add_argument("--ckpt", type=str, default="ml/checkpoints/best.pth")
+    p.add_argument("--npz", type=str, required=True, help="Path to fpgaqparms.npz")
+    p.add_argument("--meta", type=str, required=True, help="Path to fpgaqparms.json")
+    p.add_argument("--s0", type=float, required=True, help="First-layer input scale used in export (same number).")
+
+    p.add_argument("--device", type=str, default="", help="cpu or cuda; empty=auto")
+    return p.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+@torch.no_grad()
+def main() -> int:
+    args = parse_args()
+    set_seed(args.seed)
+
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    cfg = MNIST64Config(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        normalize=not args.no_normalize,
+        augment=args.augment,
+    )
+
+    train_loader, val_loader, test_loader = get_dataloaders(cfg)
+
+    # Load float model
+    model = AlexNet64Gray(num_classes=10).to(device)
+    ckpt = torch.load(Path(args.ckpt).expanduser().resolve(), map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    # Load quant params
+    qp = QParams(
+        npz_path=Path(args.npz).expanduser().resolve(),
+        meta_path=Path(args.meta).expanduser().resolve(),
+        device=device,
+    )
+
+    # Float accuracy (baseline)
+    float_acc = evaluate_float(model, test_loader, device=device)
+
+    # Quantized accuracy (PTQ theoretical limit with normalized inputs)
+    q_acc = evaluate_quantized(model, qp, test_loader, device=device, s0=float(args.s0))
+
+    print(f"Float model test accuracy:     {float_acc * 100:.2f}%")
+    print(f"Quantized PTQ test accuracy:   {q_acc * 100:.2f}%")
+    print(f"Accuracy drop:                 {(float_acc - q_acc) * 100:.2f}%")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

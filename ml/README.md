@@ -146,6 +146,7 @@ This step produces:
 
 ### Weight Quantization
 Per-output-channel symmetric:
+
 $$
 s_y[c] = \dfrac{max|w[c]|}{127}
 $$
@@ -164,6 +165,7 @@ Biases are stored as int32.
 
 ### Requantization
 We compute:
+
 $$
 M_c = \dfrac{s_x s_w[c]}{s_y}
 $$
@@ -174,9 +176,11 @@ M_c \approx \dfrac{m_c}{2^{r_c}}
 $$
 
 Enabling pure integer inference:
+
 $$
 acc = \sum(q_x \times q_x) + q_b
 $$
+
 $$
 q_y = (acc \times m) >> r
 $$

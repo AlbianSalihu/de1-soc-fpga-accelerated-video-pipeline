@@ -1,39 +1,115 @@
 # DE10-SoC FPGA-Accelerated Video Pipeline
 
-FPGA-accelerated frame processing demo on **Intel/Terasic DE10-SoC (Cyclone V SoC)**.  
-A **Linux application on the HPS** generates frames in DDR, the **FPGA fabric applies a filter using DMA** (DDR → FPGA → DDR), and the system logs **latency/throughput metrics** and **FPGA resource utilization** for benchmarking and portfolio/demo purposes.
+## Overview
+This repository is a hardware-oriented edge inference project targeting the Intel DE10-SoC (ARM + FPGA). The end goal is to run a compact CNN using a fully integer-only inference datapath on FPGA, with a verification workflow that ensures the hardware implementation matches a trusted Python reference.
+
+What’s already implemented today:
+- A minimal but complete ML + quantization + export pipeline in PyTorch (binary parameter export to .bin format pending)
+- Generation of FPGA-ready integer parameters (int8 weights, int32 biases, fixed-point requantization parameters)
+- A quantized inference verifier in Python that models integer accumulation + requantization
+
+What’s planned next (not implemented yet):
+- FPGA inference blocks (streaming conv, MAC, pooling, requantization)
+- End-to-end verification harness (Python-driven stimuli, RTL simulation, output comparison)
+
+The system is built around hardware-aware quantization, inspired by:
+> Jacob et al., Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference (2017)\
+> [https://arxiv.org/abs/1712.05877](https://arxiv.org/abs/1712.05877)
+
+## Repository Layout
+- ml/ - training, calibration, PTQ quantization, and parameter export
+- hardware/ - FPGA datapath implementation (planned / WIP)
+- software/ - HPS-side glue / drivers / runtime (planned / WIP)
+- verification/ - Python-based verification flow (planned / WIP)
+- docs/ - design notes, diagrams, and documentation
+
+## Machine Learning Pipeline
+
+The ML pipeline is located in:
+```bash
+ml/
+```
+It performs:
+- Float model training
+- Post-training activation calibration
+- Per-channel weight quantization
+- Integer-only parameter export
+- Quantized inference verification
+
+Detailed documentation: [README.md](ml/README.md)
+
+### Model
+
+The implemented network:
+AlexNet64Gray:
+- Input: 1×64×64 grayscale
+- Convolution + ReLU + MaxPool blocks
+- 3 fully-connected layers
+- Output: 10 classes
+
+Defined in: [ml/src/models/alexnet64gray.py](ml/src/models/alexnet64gray.py)
+
+The architecture was selected to:
+- Be large enough to stress hardware
+- Remain tractable for FPGA implementation
+- Avoid BatchNorm (simplifies quantization)
 
 ---
 
-## Highlights
-- **Zero-copy style pipeline** using shared DDR between HPS and FPGA
-- **FPGA DMA-based processing** (frame read → filter → frame write)
-- **Instrumentation-ready**: frame IDs, timestamps, counters (latency / throughput / drops)
-- **Reproducible results**: scripts to run tests and export CSV/plots *(WIP)*
+## End-to-End Flow
 
----
+### 1. Download dataset
+```bash
+python -m ml.scripts.download_mnist
+```
 
-## Architecture (High Level)
+### 2. Train float model
+```bash
+python -m ml.src.train.train \
+    --epochs 10 \
+    --batch-size 128 \
+    --device cuda
+```
 
-**HPS (Linux)**
-- Generates or loads frames (synthetic patterns, image sequence, or video decode)
-- Writes frames into **RAW buffer(s)** in DDR
-- Starts/controls the FPGA pipeline via memory-mapped registers
-- Collects metrics and optionally saves output frames / logs
+### 3. Calibrate activation scales (Post-Training Quantization)
+```bash
+python -m ml.src.export.find_scales \
+    --ckpt ml/checkpoints/best.pth \
+    --hook relu \
+    --percentile 0.999
+```
 
-**FPGA (Fabric)**
-- DMA reads from **RAW buffer(s)** in DDR
-- Applies an image filter (configurable)
-- DMA writes to **FILTERED buffer(s)** in DDR
-- Updates counters / “frame done” flags / timestamps for profiling
+### 4. Quantize weights + compute FPGA parameters
+```bash
+python -m ml.src.export.quantize_weights \
+    --ckpt ml/checkpoints/best.pth \
+    --sy ml/checkpoints/act_scales_sy.json \
+    --s0 0.02
+```
 
-**DDR Memory (Shared)**
-- RAW buffers: produced by HPS
-- FILTERED buffers: produced by FPGA
-- Optional double-buffering (ping-pong) to avoid tearing
+### 5. Verify integer inference accuracy
+```bash
+python -m ml.src.export.test_quantized_model \
+    --npz ml/checkpoints/fpga_qparams.npz \
+    --meta ml/checkpoints/fpga_qparams.json \
+    --s0 0.02
+```
 
-> Target demo output: latency/throughput graphs + Quartus resource reports (LUT/FF/BRAM/DSP).
+## What This Enables
+This project is not about training MNIST.
 
----
+It is about enabling:
+- FPGA-accelerated neural inference
+- Edge AI deployment
+- Deterministic low-latency video processing
+- Integer-only compute pipelines
+- Custom hardware acceleration blocks
 
-## Repository Layout (Planned)
+The same architecture applies to:
+- CNN-based video filters
+- Object detection accelerators
+- Embedded computer vision
+- Industrial image processing
+- Real-time sensor pipelines
+
+

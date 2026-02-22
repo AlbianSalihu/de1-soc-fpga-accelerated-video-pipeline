@@ -21,7 +21,7 @@ The system is built around hardware-aware quantization, inspired by:
 - hardware/ - FPGA datapath implementation (planned / WIP)
 - software/ - HPS-side glue / drivers / runtime (planned / WIP)
 - verification/ - Python-based verification flow (planned / WIP)
-- docs/ - design notes, diagrams, and documentation
+- docs/ - design notes, diagrams, and documentation (planned / WIP)
 
 ## Machine Learning Pipeline
 

@@ -165,15 +165,18 @@ We compute:
 $$
 M_c = \dfrac{s_x s_w[c]}{s_y}
 $$
+
 Then approximate:
 $$
 M_c \approx \dfrac{m_c}{2^{r_c}}
 $$
+
 Enabling pure integer inference:
 $$
 acc = \sum(q_x \times q_x) + q_b\\
 q_y = (acc \times m) >> r
 $$
+
 No float operations required on FPGA.
 
 ## Quantized Inference Verification

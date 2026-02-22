@@ -178,7 +178,7 @@ $$
 Enabling pure integer inference:
 
 $$
-acc = \sum(q_x \times q_x) + q_b
+acc = \sum(q_x \times q_w) + q_b
 $$
 
 $$

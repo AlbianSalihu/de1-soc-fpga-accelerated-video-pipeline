@@ -16,3 +16,10 @@ ml/checkpoints/
 ml/runs/
 ml/outputs/
 !ml/outputs/exported/
+
+# Quartus generated folders
+Quartus/**/db/
+Quartus/**/incremental_db/
+Quartus/**/greybox_tmp/
+Quartus/**/qdb/
+Quartus/**/hc_output/

@@ -1,0 +1,29 @@
+{
+  "args": {
+    "data_dir": "ml/data",
+    "epochs": 1,
+    "batch_size": 128,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "num_workers": 2,
+    "val_ratio": 0.1,
+    "seed": 1234,
+    "no_normalize": false,
+    "augment": false,
+    "out_dir": "ml/checkpoints",
+    "device": ""
+  },
+  "dataset_cfg": {
+    "data_dir": "ml/data",
+    "image_size": 64,
+    "batch_size": 128,
+    "num_workers": 2,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "val_ratio": 0.1,
+    "seed": 1234,
+    "normalize": true,
+    "augment": false
+  },
+  "model": "AlexNet64Gray"
+}

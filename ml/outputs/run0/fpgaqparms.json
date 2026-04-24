@@ -1,0 +1,217 @@
+{
+  "layers": [
+    {
+      "name": "features.0",
+      "type": "Conv2d",
+      "weight_shape": [
+        64,
+        1,
+        5,
+        5
+      ],
+      "bias_shape": [
+        64
+      ],
+      "s_x": 0.02221642937,
+      "s_y": 0.009025303522745769,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": true,
+      "export_keys": {
+        "W_q": "features_0__W_q_int8",
+        "B_q": "features_0__B_q_int32",
+        "m": "features_0__m_int32",
+        "r": "features_0__r_int32",
+        "s_w_debug": "features_0__s_w_fp32"
+      }
+    },
+    {
+      "name": "features.3",
+      "type": "Conv2d",
+      "weight_shape": [
+        192,
+        64,
+        3,
+        3
+      ],
+      "bias_shape": [
+        192
+      ],
+      "s_x": 0.009025303522745769,
+      "s_y": 0.0063523016723932004,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": true,
+      "export_keys": {
+        "W_q": "features_3__W_q_int8",
+        "B_q": "features_3__B_q_int32",
+        "m": "features_3__m_int32",
+        "r": "features_3__r_int32",
+        "s_w_debug": "features_3__s_w_fp32"
+      }
+    },
+    {
+      "name": "features.6",
+      "type": "Conv2d",
+      "weight_shape": [
+        384,
+        192,
+        3,
+        3
+      ],
+      "bias_shape": [
+        384
+      ],
+      "s_x": 0.0063523016723932004,
+      "s_y": 0.0076129497266283225,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": true,
+      "export_keys": {
+        "W_q": "features_6__W_q_int8",
+        "B_q": "features_6__B_q_int32",
+        "m": "features_6__m_int32",
+        "r": "features_6__r_int32",
+        "s_w_debug": "features_6__s_w_fp32"
+      }
+    },
+    {
+      "name": "features.8",
+      "type": "Conv2d",
+      "weight_shape": [
+        256,
+        384,
+        3,
+        3
+      ],
+      "bias_shape": [
+        256
+      ],
+      "s_x": 0.0076129497266283225,
+      "s_y": 0.01066427417829925,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": true,
+      "export_keys": {
+        "W_q": "features_8__W_q_int8",
+        "B_q": "features_8__B_q_int32",
+        "m": "features_8__m_int32",
+        "r": "features_8__r_int32",
+        "s_w_debug": "features_8__s_w_fp32"
+      }
+    },
+    {
+      "name": "features.10",
+      "type": "Conv2d",
+      "weight_shape": [
+        256,
+        256,
+        3,
+        3
+      ],
+      "bias_shape": [
+        256
+      ],
+      "s_x": 0.01066427417829925,
+      "s_y": 0.007546396348990646,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": true,
+      "export_keys": {
+        "W_q": "features_10__W_q_int8",
+        "B_q": "features_10__B_q_int32",
+        "m": "features_10__m_int32",
+        "r": "features_10__r_int32",
+        "s_w_debug": "features_10__s_w_fp32"
+      }
+    },
+    {
+      "name": "classifier.1",
+      "type": "Linear",
+      "weight_shape": [
+        1024,
+        16384
+      ],
+      "bias_shape": [
+        1024
+      ],
+      "s_x": 0.007546396348990646,
+      "s_y": 0.027013640310250078,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": true,
+      "export_keys": {
+        "W_q": "classifier_1__W_q_int8",
+        "B_q": "classifier_1__B_q_int32",
+        "m": "classifier_1__m_int32",
+        "r": "classifier_1__r_int32",
+        "s_w_debug": "classifier_1__s_w_fp32"
+      }
+    },
+    {
+      "name": "classifier.3",
+      "type": "Linear",
+      "weight_shape": [
+        1024,
+        1024
+      ],
+      "bias_shape": [
+        1024
+      ],
+      "s_x": 0.027013640310250078,
+      "s_y": 0.021966311510871438,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": true,
+      "export_keys": {
+        "W_q": "classifier_3__W_q_int8",
+        "B_q": "classifier_3__B_q_int32",
+        "m": "classifier_3__m_int32",
+        "r": "classifier_3__r_int32",
+        "s_w_debug": "classifier_3__s_w_fp32"
+      }
+    },
+    {
+      "name": "classifier.5",
+      "type": "Linear",
+      "weight_shape": [
+        10,
+        1024
+      ],
+      "bias_shape": [
+        10
+      ],
+      "s_x": 0.021966311510871438,
+      "s_y": null,
+      "weight_scales_per_out_channel": true,
+      "post_relu_quantized": false,
+      "export_keys": {
+        "W_q": "classifier_5__W_q_int8",
+        "B_q": "classifier_5__B_q_int32",
+        "m": null,
+        "r": null,
+        "s_w_debug": "classifier_5__s_w_fp32"
+      }
+    }
+  ],
+  "assumptions": {
+    "weights": "int8 symmetric per-output-channel",
+    "activations": "uint8 post-ReLU with z=0 (as calibrated)",
+    "bias": "int32 in accumulator units",
+    "requant": "qy ~= (acc*m + rounding) >> r"
+  },
+  "inputs": {
+    "s0": 0.02221642937,
+    "zx": 0,
+    "zy": 0
+  },
+  "sources": {
+    "checkpoint": "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/ml/checkpoints/best.pth",
+    "sy_json": "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/ml/checkpoints/act_scales_sy.json"
+  },
+  "mnist64_cfg": {
+    "data_dir": "ml/data",
+    "image_size": 64,
+    "batch_size": 128,
+    "num_workers": 2,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "val_ratio": 0.1,
+    "seed": 1234,
+    "normalize": true,
+    "augment": false
+  }
+}

@@ -70,30 +70,35 @@ python -m ml.src.train.train \
     --batch-size 128 \
     --device cuda
 ```
+Outputs: `ml/checkpoints/runN/{best,last}.pth`, `ml/runs/runN/{run_meta,final_report}.json`
 
 ### 3. Calibrate activation scales (Post-Training Quantization)
 ```bash
 python -m ml.src.export.find_scales \
-    --ckpt ml/checkpoints/best.pth \
     --hook relu \
     --percentile 0.999
 ```
+Auto-detects latest run. Outputs: `ml/outputs/runN/act_scales_sy.json`
 
 ### 4. Quantize weights + compute FPGA parameters
 ```bash
 python -m ml.src.export.quantize_weights \
-    --ckpt ml/checkpoints/best.pth \
-    --sy ml/checkpoints/act_scales_sy.json \
     --s0 0.02
 ```
+Auto-detects latest run. Outputs: `ml/outputs/runN/fpgaqparms.{npz,json}`
 
 ### 5. Verify integer inference accuracy
 ```bash
 python -m ml.src.export.test_quantized_model \
-    --npz ml/checkpoints/fpga_qparams.npz \
-    --meta ml/checkpoints/fpga_qparams.json \
     --s0 0.02
 ```
+Auto-detects latest run. Compares float vs quantized accuracy.
+
+### 6. Export FPGA binary
+```bash
+python -m ml.src.export.export_weights
+```
+Auto-detects latest run. Outputs: `ml/outputs/runN/fpgaqparms.bin`
 
 ## What This Enables
 This project is not about training MNIST.

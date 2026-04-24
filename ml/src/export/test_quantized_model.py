@@ -371,9 +371,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-normalize", action="store_true", help="Disable dataset normalization (normally keep OFF for this test).")
     p.add_argument("--augment", action="store_true", help="Enable augmentation (keep OFF for eval).")
 
-    p.add_argument("--ckpt", type=str, default="ml/checkpoints/best.pth")
-    p.add_argument("--npz", type=str, required=True, help="Path to fpgaqparms.npz")
-    p.add_argument("--meta", type=str, required=True, help="Path to fpgaqparms.json")
+    p.add_argument("--checkpoints-dir", type=str, default="ml/checkpoints", help="Base dir for model weights")
+    p.add_argument("--outputs-dir",     type=str, default="ml/outputs",     help="Base dir for export outputs")
+    p.add_argument("--run-id",          type=int, default=-1, help="Run ID to use (default: latest)")
+    p.add_argument("--ckpt", type=str,  default="", help="Override checkpoint path (overrides --run-id)")
+    p.add_argument("--npz",  type=str,  default="", help="Override fpgaqparms.npz path (overrides --run-id)")
+    p.add_argument("--meta", type=str,  default="", help="Override fpgaqparms.json path (overrides --run-id)")
     p.add_argument("--s0", type=float, required=True, help="First-layer input scale used in export (same number).")
 
     p.add_argument("--device", type=str, default="", help="cpu or cuda; empty=auto")
@@ -387,9 +390,31 @@ def set_seed(seed: int) -> None:
 
 
 @torch.no_grad()
+def _latest_run_id(checkpoints_base: Path) -> int:
+    """Return the ID of the latest existing runN folder in checkpoints_base."""
+    i = 0
+    while (checkpoints_base / f"run{i}").exists():
+        i += 1
+    if i == 0:
+        raise RuntimeError(f"No runs found in {checkpoints_base}. Run train.py first.")
+    return i - 1
+
+
 def main() -> int:
     args = parse_args()
     set_seed(args.seed)
+
+    # -- Resolve run-id based paths -------------------------------------------
+    checkpoints_base = Path(args.checkpoints_dir).expanduser().resolve()
+    outputs_base     = Path(args.outputs_dir).expanduser().resolve()
+    run_id           = args.run_id if args.run_id >= 0 else _latest_run_id(checkpoints_base)
+
+    ckpt_path  = Path(args.ckpt).expanduser().resolve()  if args.ckpt \
+                 else checkpoints_base / f"run{run_id}" / "best.pth"
+    npz_path   = Path(args.npz).expanduser().resolve()   if args.npz  \
+                 else outputs_base / f"run{run_id}" / "fpgaqparms.npz"
+    meta_path  = Path(args.meta).expanduser().resolve()  if args.meta \
+                 else outputs_base / f"run{run_id}" / "fpgaqparms.json"
 
     if args.device:
         device = torch.device(args.device)
@@ -410,14 +435,14 @@ def main() -> int:
 
     # Load float model
     model = AlexNet64Gray(num_classes=10).to(device)
-    ckpt = torch.load(Path(args.ckpt).expanduser().resolve(), map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     # Load quant params
     qp = QParams(
-        npz_path=Path(args.npz).expanduser().resolve(),
-        meta_path=Path(args.meta).expanduser().resolve(),
+        npz_path=npz_path,
+        meta_path=meta_path,
         device=device,
     )
 

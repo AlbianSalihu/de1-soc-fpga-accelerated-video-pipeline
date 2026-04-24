@@ -1,0 +1,77 @@
+{
+  "calibration": {
+    "split": "train",
+    "max_batches": 0,
+    "percentile": 0.999,
+    "sample_per_batch": 20000,
+    "hook": "relu",
+    "include_logits": false,
+    "device": "cpu"
+  },
+  "mnist64_cfg": {
+    "data_dir": "ml/data",
+    "image_size": 64,
+    "batch_size": 128,
+    "num_workers": 2,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "val_ratio": 0.1,
+    "seed": 1234,
+    "normalize": true,
+    "augment": false
+  },
+  "checkpoint": "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/ml/checkpoints/best.pth",
+  "sy": {
+    "features.1": 0.009025303522745769,
+    "features.4": 0.0063523016723932004,
+    "features.7": 0.0076129497266283225,
+    "features.9": 0.01066427417829925,
+    "features.11": 0.007546396348990646,
+    "classifier.2": 0.027013640310250078,
+    "classifier.4": 0.021966311510871438
+  },
+  "details": {
+    "features.1": {
+      "percentile_value": 2.301452398300171,
+      "max_value": 2.971933603286743,
+      "denom": 255,
+      "kind": "post_relu_uint8"
+    },
+    "features.4": {
+      "percentile_value": 1.6198369264602661,
+      "max_value": 3.6800031661987305,
+      "denom": 255,
+      "kind": "post_relu_uint8"
+    },
+    "features.7": {
+      "percentile_value": 1.9413021802902222,
+      "max_value": 4.496333122253418,
+      "denom": 255,
+      "kind": "post_relu_uint8"
+    },
+    "features.9": {
+      "percentile_value": 2.7193899154663086,
+      "max_value": 5.992794990539551,
+      "denom": 255,
+      "kind": "post_relu_uint8"
+    },
+    "features.11": {
+      "percentile_value": 1.9243310689926147,
+      "max_value": 4.836174488067627,
+      "denom": 255,
+      "kind": "post_relu_uint8"
+    },
+    "classifier.2": {
+      "percentile_value": 6.8884782791137695,
+      "max_value": 11.878676414489746,
+      "denom": 255,
+      "kind": "post_relu_uint8"
+    },
+    "classifier.4": {
+      "percentile_value": 5.601409435272217,
+      "max_value": 10.710553169250488,
+      "denom": 255,
+      "kind": "post_relu_uint8"
+    }
+  }
+}

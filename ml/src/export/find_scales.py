@@ -18,6 +18,16 @@ import torch.nn as nn
 from ml.src.data.mnist64 import MNIST64Config, get_dataloaders
 from ml.src.models.alexnet64gray import AlexNet64Gray
 
+
+def _latest_run_id(checkpoints_base: Path) -> int:
+    """Return the ID of the latest existing runN folder in checkpoints_base."""
+    i = 0
+    while (checkpoints_base / f"run{i}").exists():
+        i += 1
+    if i == 0:
+        raise RuntimeError(f"No runs found in {checkpoints_base}. Run train.py first.")
+    return i - 1
+
 class RunningTensorStats:
     """
     Statistics collector for layer output tensors.
@@ -125,7 +135,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-normalize", action="store_true", help="Disable MNIST mean/std normalization")
     p.add_argument("--augment", action="store_true", help="Enable light RandomAffine augmentation")
 
-    p.add_argument("--ckpt", type=str, default="ml/checkpoints/best.pth", help="Path to checkpoint (best.pth)")
+    p.add_argument("--checkpoints-dir", type=str, default="ml/checkpoints", help="Base dir for model weights")
+    p.add_argument("--outputs-dir",     type=str, default="ml/outputs",     help="Base dir for export outputs")
+    p.add_argument("--run-id",          type=int, default=-1, help="Run ID to use (default: latest)")
+    p.add_argument("--ckpt", type=str,  default="", help="Override checkpoint path (overrides --run-id)")
+    p.add_argument("--out",  type=str,  default="", help="Override output JSON path (overrides --run-id)")
     p.add_argument("--device", type=str, default="", help="Force device: 'cpu' or 'cuda'. Empty = auto")
 
     p.add_argument("--split", type=str, default="train", choices=["train", "val", "test"],
@@ -135,7 +149,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--percentile", type=float, default=0.999, help="Percentile for range (e.g. 0.999 for 99.9%)")
     p.add_argument("--sample-per-batch", type=int, default=20000,
                    help="How many activation values to subsample per layer per batch")
-    p.add_argument("--out", type=str, default="ml/checkpoints/act_scales_sy.json", help="Output JSON path")
 
     p.add_argument("--hook", type=str, default="relu", choices=["relu", "conv", "linear"],
                    help="Which module outputs to treat as quantization points. For your design use 'relu'.")
@@ -275,8 +288,22 @@ def main() -> int:
     """
     args = parse_args()
     set_seed(args.seed)
-    
-    # make config
+
+    # -- Resolve run-id based paths -------------------------------------------
+    checkpoints_base = Path(args.checkpoints_dir).expanduser().resolve()
+    outputs_base     = Path(args.outputs_dir).expanduser().resolve()
+    run_id           = args.run_id if args.run_id >= 0 else _latest_run_id(checkpoints_base)
+
+    ckpt_path = Path(args.ckpt).expanduser().resolve() if args.ckpt \
+                else checkpoints_base / f"run{run_id}" / "best.pth"
+    out_path  = Path(args.out).expanduser().resolve()  if args.out  \
+                else outputs_base / f"run{run_id}" / "act_scales_sy.json"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[find_scales] run{run_id}  ckpt    → {ckpt_path}")
+    print(f"[find_scales] run{run_id}  output  → {out_path}")
+
+    # -- Config ---------------------------------------------------------------
     cfg = MNIST64Config(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
@@ -286,20 +313,19 @@ def main() -> int:
         normalize=not args.no_normalize,
         augment=args.augment,
     )
-    
-    # chose device
+
+    # -- Device ---------------------------------------------------------------
     if args.device:
         device = torch.device(args.device)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # build data iterator
+    # -- Data -----------------------------------------------------------------
     train_loader, val_loader, test_loader = get_dataloaders(cfg)
     loader = pick_loader(args.split, train_loader, val_loader, test_loader)
 
-    # Load model + checkpoint
+    # -- Model + checkpoint ---------------------------------------------------
     model = AlexNet64Gray(num_classes=10).to(device)
-    ckpt_path = Path(args.ckpt).expanduser().resolve()
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -363,9 +389,6 @@ def main() -> int:
             "denom": denom,
             "kind": kind,
         }
-
-    out_path = Path(args.out).expanduser().resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "calibration": {

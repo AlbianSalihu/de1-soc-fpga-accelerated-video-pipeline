@@ -13,7 +13,7 @@
 #   python -m ml.src.export.quantize_weights \
 #       --ckpt ml/checkpoints/best.pth \
 #       --sy ml/checkpoints/act_scales_sy.json \
-#       --out ml/checkpoints/fpga_qparams \
+#       --out ml/checkpoints/fpgaqparms \
 #       --s0 0.02221642937
 
 from __future__ import annotations
@@ -29,6 +29,16 @@ import torch
 import torch.nn as nn
 
 from ml.src.models.alexnet64gray import AlexNet64Gray
+
+
+def _latest_run_id(checkpoints_base: Path) -> int:
+    """Return the ID of the latest existing runN folder in checkpoints_base."""
+    i = 0
+    while (checkpoints_base / f"run{i}").exists():
+        i += 1
+    if i == 0:
+        raise RuntimeError(f"No runs found in {checkpoints_base}. Run train.py first.")
+    return i - 1
 
 def quantize_M_to_mr(M: float)->Tuple[int, int]:
     """Convert positive float M into integer pair (m,r) such that:
@@ -229,9 +239,12 @@ def parse_args()->argparse.Namespace:
           - export_last_layer_mr: if set, attempt to export (m,r) for final logits layer
     """
     p = argparse.ArgumentParser(description="Quantize weights + compute (m,r) using activation scales from calibration.")
-    p.add_argument("--ckpt", type=str, default="ml/checkpoints/best.pth", help="Checkpoint path")
-    p.add_argument("--sy", type=str, default="ml/checkpoints/act_scales_sy.json", help="Activation scales JSON from find_scales.py")
-    p.add_argument("--out", type=str, default="ml/checkpoints/fpga_qparams", help="Output prefix (writes .npz + .json)")
+    p.add_argument("--checkpoints-dir", type=str, default="ml/checkpoints", help="Base dir for model weights")
+    p.add_argument("--outputs-dir",     type=str, default="ml/outputs",     help="Base dir for export outputs")
+    p.add_argument("--run-id",          type=int, default=-1, help="Run ID to use (default: latest)")
+    p.add_argument("--ckpt", type=str,  default="", help="Override checkpoint path (overrides --run-id)")
+    p.add_argument("--sy",   type=str,  default="", help="Override activation scales path (overrides --run-id)")
+    p.add_argument("--out",  type=str,  default="", help="Override output prefix (overrides --run-id)")
     p.add_argument("--device", type=str, default="", help="cpu or cuda, empty = auto")
 
     # First layer input scale
@@ -268,13 +281,27 @@ def main() -> int:
     """
     args = parse_args()
 
+    # -- Resolve run-id based paths -------------------------------------------
+    checkpoints_base = Path(args.checkpoints_dir).expanduser().resolve()
+    outputs_base     = Path(args.outputs_dir).expanduser().resolve()
+    run_id           = args.run_id if args.run_id >= 0 else _latest_run_id(checkpoints_base)
+
+    ckpt_path  = Path(args.ckpt).expanduser().resolve() if args.ckpt \
+                 else checkpoints_base / f"run{run_id}" / "best.pth"
+    sy_path    = Path(args.sy).expanduser().resolve()   if args.sy   \
+                 else outputs_base / f"run{run_id}" / "act_scales_sy.json"
+    out_prefix = Path(args.out).expanduser().resolve()  if args.out  \
+                 else outputs_base / f"run{run_id}" / "fpgaqparms"
+
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[quantize_weights] run{run_id}  ckpt   → {ckpt_path}")
+    print(f"[quantize_weights] run{run_id}  scales → {sy_path}")
+    print(f"[quantize_weights] run{run_id}  output → {out_prefix}.(npz|json)")
+
     if args.device:
         device = torch.device(args.device)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    ckpt_path = Path(args.ckpt).expanduser().resolve()
-    sy_path = Path(args.sy).expanduser().resolve()
 
     # Load calibration JSON produced by find_scales.py
     sy_payload = json.loads(sy_path.read_text())
@@ -407,9 +434,6 @@ def main() -> int:
         # Chain s_x forward if we have s_y
         if has_relu_after:
             s_x = float(s_y)
-
-    out_prefix = Path(args.out).expanduser().resolve()
-    out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
     npz_path = out_prefix.with_suffix(".npz")
     json_path = out_prefix.with_suffix(".json")

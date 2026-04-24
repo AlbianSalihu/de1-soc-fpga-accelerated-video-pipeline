@@ -15,7 +15,9 @@
 #           --val-ratio 0.1 \
 #           --seed 1234 \
 #           --augment \
-#           --out-dir ml/checkpoints \
+#           --checkpoints-dir ml/checkpoints \
+#           --runs-dir ml/runs \
+#           --run-id 0 \
 #           --device cuda
 #
 # Notes:
@@ -198,9 +200,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--no-normalize", action="store_true", help="Disable MNIST mean/std normalization")
     p.add_argument("--augment", action="store_true", help="Enable light RandomAffine augmentation")
-    p.add_argument("--out-dir", type=str, default="ml/checkpoints", help="Where to save checkpoints")
+    p.add_argument("--checkpoints-dir", type=str, default="ml/checkpoints", help="Base dir for model weights")
+    p.add_argument("--runs-dir", type=str, default="ml/runs", help="Base dir for run metadata")
+    p.add_argument("--run-id", type=int, default=-1, help="Run ID (default: auto-increment from existing runs)")
     p.add_argument("--device", type=str, default="", help="Force device: 'cpu' or 'cuda'. Empty = auto")
     return p.parse_args()
+
+
+def _next_run_id(checkpoints_base: Path) -> int:
+    """Return the next available run ID by scanning checkpoints_base for existing runN folders."""
+    i = 0
+    while (checkpoints_base / f"run{i}").exists():
+        i += 1
+    return i
 
 def set_seed(seed: int) -> None:
     """Set RNG seeds for reproductibilty.
@@ -241,27 +253,37 @@ def main()->int:
     else:
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    checkpoints_base = Path(args.checkpoints_dir).expanduser().resolve()
+    runs_base        = Path(args.runs_dir).expanduser().resolve()
+
+    run_id  = args.run_id if args.run_id >= 0 else _next_run_id(checkpoints_base)
+    ckpt_dir = checkpoints_base / f"run{run_id}"
+    runs_dir = runs_base        / f"run{run_id}"
+
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[train] run{run_id}  checkpoints → {ckpt_dir}")
+    print(f"[train] run{run_id}  metadata    → {runs_dir}")
+
     # Build dataloaders
     train_loader, val_loader, test_loader = get_dataloaders(cfg)
 
     model = AlexNet64Gray(num_classes=10).to(device)
-    
-    loss_fn = nn.CrossEntropyLoss()
+
+    loss_fn   = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    out_dir = Path(args.out_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True,exist_ok=True)
-
     run_meta = {
+        "run_id": run_id,
         "args": vars(args),
         "dataset_cfg": asdict(cfg),
         "model": "AlexNet64Gray",
     }
-    
-    (out_dir / "run_meta.json").write_text(json.dumps(run_meta,indent=2))
+    (runs_dir / "run_meta.json").write_text(json.dumps(run_meta, indent=2))
 
     best_val_acc = -1.0
-    best_epoch = -1
+    best_epoch   = -1
 
     for epoch in range(1, args.epochs + 1):
         tr_loss, tr_acc = train_one_epoch(model, train_loader, loss_fn, optimizer, device)
@@ -269,26 +291,26 @@ def main()->int:
 
         print(
             f"Epoch {epoch:02d}/{args.epochs} |"
-            f"train loss {tr_loss:.4f} acc {tr_acc*100:.2f}% |" 
+            f"train loss {tr_loss:.4f} acc {tr_acc*100:.2f}% |"
             f"val loss {val_loss:.4f} acc {val_acc*100:.2f}% |"
         )
 
         save_checkpoint(
-            out_dir=out_dir,
+            out_dir=ckpt_dir,
             model=model,
             optimizer=optimizer,
             epoch=epoch,
             best_val_acc=best_val_acc,
             cfg=cfg,
-            extra={"train_loss": tr_loss, "train_acc": tr_acc, "val_loss":val_loss, "val_acc":val_acc},
+            extra={"train_loss": tr_loss, "train_acc": tr_acc, "val_loss": val_loss, "val_acc": val_acc},
             filename="last.pth",
         )
 
-        if val_acc>best_val_acc:
+        if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_epoch=epoch
+            best_epoch   = epoch
             save_checkpoint(
-                out_dir=out_dir,
+                out_dir=ckpt_dir,
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
@@ -297,7 +319,8 @@ def main()->int:
                 extra={"train_loss": tr_loss, "train_acc": tr_acc, "val_loss": val_loss, "val_acc": val_acc},
                 filename="best.pth",
             )
-    best_path = out_dir / "best.pth"
+
+    best_path = ckpt_dir / "best.pth"
     if best_path.exists():
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -311,7 +334,7 @@ def main()->int:
         "test_loss": te_loss,
         "test_acc": te_acc,
     }
-    (out_dir/"final_report.json").write_text(json.dumps(report,indent=2))
+    (runs_dir / "final_report.json").write_text(json.dumps(report, indent=2))
     return 0
 
 if __name__ == "__main__":

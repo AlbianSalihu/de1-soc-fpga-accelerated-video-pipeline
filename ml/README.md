@@ -11,35 +11,39 @@ The quantization design is inspired by:
 ## Folder structure:
 ```
 ml
-├─ Readme.md : The current file
-├─ requirements.txt : All requirements to run the machine learning parts
+├─ Readme.md                    : The current file
+├─ requirements.txt             : Python dependencies
 ├─ checkpoints
-│  ├─ act_scales_sy.json:
-│  ├─ best.pth:
-│  ├─ final_report.json:
-│  ├─ fpgaqparms.json:
-│  ├─ fpgaqparms.npz: 
-│  └─ last.pth:
-├─ config
-├─ data
-│  └─MNIST
-│    └─ mnist images for training
-├─ outputs
+│  └─ run0                      : Auto-incremented per training run (not tracked by git)
+│     ├─ best.pth               : Best validation checkpoint
+│     └─ last.pth               : Latest epoch checkpoint
 ├─ runs
+│  └─ run0                      : Mirrors checkpoints/runN (tracked by git)
+│     ├─ run_meta.json          : Training config and args
+│     └─ final_report.json      : Test metrics from best checkpoint
+├─ outputs
+│  └─ run0                      : Export artifacts for runN
+│     ├─ act_scales_sy.json     : Per-layer activation scales (tracked)
+│     ├─ fpgaqparms.json        : Layer metadata + quantization params (tracked)
+│     ├─ fpgaqparms.npz         : Integer weight arrays (not tracked)
+│     └─ fpgaqparms.bin         : FPGA-ready binary (not tracked)
+├─ data
+│  └─ MNIST
+│     └─ mnist images for training
 ├─ scripts
-│  └─ download_mnist.py: 
+│  └─ download_mnist.py
 └─ src
-   ├─ data:
+   ├─ data
    │  └─ mnist64.py
-   ├─ export:
-   │  ├─ export_weights.py:
-   │  ├─ find_scales.py:
-   │  ├─ quantize_weights.py: 
-   │  └─ test_quantized_model.py: 
-   ├─ models:
+   ├─ export
+   │  ├─ export_weights.py
+   │  ├─ find_scales.py
+   │  ├─ quantize_weights.py
+   │  └─ test_quantized_model.py
+   ├─ models
    │  └─ alexnet64gray.py
-   └─ train:
-      └─ train.py 
+   └─ train
+      └─ train.py
 ```
 
 ## Dataset
@@ -104,11 +108,14 @@ Script: [train.py](src/train/train.py)
 - Automatic checkpointing
 - Final test evaluation
 
-### Outputs:
-- best.pth: Best validation model
-- last.pth: Last epoch model
-- run_meta.json: Training configuration
-- final_report.json: Final test metrics
+### Outputs
+Written to `ml/checkpoints/runN/`:
+- `best.pth`: Best validation checkpoint
+- `last.pth`: Latest epoch checkpoint
+
+Written to `ml/runs/runN/`:
+- `run_meta.json`: Training configuration and CLI args
+- `final_report.json`: Final test metrics from best checkpoint
 
 ## Activation Calibration (PTQ)
 Script: [find_scales.py](src/export/find_scales.py)
@@ -203,10 +210,17 @@ It compares:
 This represents the theoretical FPGA upper bound.
 
 ## Files Produced
-- best.pth : Best float model
-- act_scales_sy.json : Activation scales
-- fpga_qparams.npz : All integer arrays
-- fpga_qparams.json : Metadata + layer mapping
+
+| File | Location | Tracked | Description |
+|------|----------|---------|-------------|
+| `best.pth` | `checkpoints/runN/` | No | Best float checkpoint |
+| `last.pth` | `checkpoints/runN/` | No | Latest epoch checkpoint |
+| `run_meta.json` | `runs/runN/` | Yes | Training config |
+| `final_report.json` | `runs/runN/` | Yes | Test metrics |
+| `act_scales_sy.json` | `outputs/runN/` | Yes | Per-layer activation scales |
+| `fpgaqparms.json` | `outputs/runN/` | Yes | Layer metadata + quant params |
+| `fpgaqparms.npz` | `outputs/runN/` | No | Integer weight arrays |
+| `fpgaqparms.bin` | `outputs/runN/` | No | FPGA-ready binary |
 
 ## FPGA Compatibility Assumptions
 - Post-ReLU activations -> uint8 (post-ReLU)

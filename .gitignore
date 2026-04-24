@@ -11,11 +11,12 @@ env/
 ml/data
 ml/data/**
 
-# Training artifacts
+# checkpoints: model weights only, never tracked
 ml/checkpoints/
-ml/runs/
-ml/outputs/
-!ml/outputs/exported/
+
+# outputs: JSON metadata tracked, large binaries ignored
+ml/outputs/**/*.npz
+ml/outputs/**/*.bin
 
 # Quartus generated folders
 hardware/Quartus/**/db/

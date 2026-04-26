@@ -784,6 +784,77 @@ hardware/rtl/
 
 ---
 
+### 5.7 V1/V2 Modularity Strategy
+
+The architecture is designed so that v2 improvements — HPS offload, dynamic weight loading,
+master control — require **wiring changes at the top level only**. No layer module is
+ever rewritten between versions.
+
+This is achieved by separating two independent concerns inside each layer:
+
+#### Data plane vs control plane
+
+**Data plane** — always on FPGA, unchanged between versions:
+- Activations stream between layers via Avalon-ST (valid/ready/data)
+- Each layer has one streaming input and one streaming output
+- The MAC array, line buffer, and requant unit are purely data-driven
+
+**Control plane** — evolves between versions:
+- V1: no master; weights initialised from `.mif` files at power-on; port B tied off
+- V2: a master (HPS ARM or FPGA state machine) writes weights at runtime via port B
+
+#### Dual-port BRAM weight storage (internal implementation detail)
+
+Weights are **internal** to each layer — nothing crosses the layer boundary for weights
+in V1. The layer is a black box with only data in and data out:
+
+```
+         ┌─────────────────────────────────────┐
+         │              conv_layer              │
+         │                                     │
+data ────►  in                           out ──►  data
+         │                                     │
+         │   ┌─────────────┐                  │
+         │   │ weight BRAM │                  │
+         │   │  port A ────┼──► MAC array     │
+         │   │  port B     │  (tied off, V1)  │
+         │   └─────────────┘                  │
+         │   line buffer, sliding window, ...  │
+         └─────────────────────────────────────┘
+```
+
+Inside the BRAM, port A is read every cycle by the MAC array. Port B exists physically
+but is tied off in V1 — no ports are exposed on the layer boundary.
+
+In V2, port B gets wired up: it becomes actual input ports on the layer module,
+connected to a master via Avalon-MM. That change is local to the layer's port list
+and the top-level wiring — the internal MAC array and compute logic are untouched.
+
+#### V2 address map
+
+When port B is exposed in V2, each layer is assigned a fixed base address on the
+Avalon-MM bus. The master routes weight writes by address — no layer ID signal needed.
+
+| Layer | Base address | Weight size |
+|-------|-------------|-------------|
+| Conv1 | 0x0000_0000 | 2 KB |
+| Conv2 | 0x0000_1000 | 112 KB |
+| Conv3–5 | SDRAM-mapped | — |
+| FC8 | 0x0002_0000 | 11 KB |
+
+#### Interface width and parallelism
+
+The Avalon-ST data bus between layers carries **one uint8 activation per cycle**.
+Internal parallelism is controlled by the `G_PAR_MACS` generic — it sets how many
+MAC units run simultaneously inside a layer, completely independent of the external
+interface width.
+
+- The inter-layer interface stays narrow and simple (8-bit)
+- Each layer scales its internal compute independently via `G_PAR_MACS`
+- Increasing parallelism in one layer never affects any other layer's interface
+
+---
+
 ## Step 6 — Implementation Plan & Build Order
 
 The implementation follows a strict **bottom-up, simulation-first** discipline:

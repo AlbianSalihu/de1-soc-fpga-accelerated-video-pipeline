@@ -46,3 +46,16 @@ quartus/**/simulation/
 transcript
 *.wlf
 
+# Verification: fixtures PNGs and meta tracked, large binaries ignored
+verification/fixtures/**/*.bin
+
+# Verification: vectors are fully generated — nothing tracked
+verification/vectors/
+
+# Verification: simulation results are generated — nothing tracked
+verification/results/
+
+# GHDL build artefacts
+verification/sim/*.cf
+*.ghw
+

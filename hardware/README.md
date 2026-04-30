@@ -1000,3 +1000,285 @@ pipeline_ctrl ──────────────────────
 | SDRAM refresh stall exceeds weight FIFO depth, causing MAC pipeline to starve | Medium | Medium | Size FIFOs to absorb worst-case refresh duration (≤ 7.8 µs = 780 cycles at 100 MHz) |
 | requant intermediate (acc × m) overflows int64 before the right-shift | Low | High | Pre-verified in Python before export; overflow assertion added to testbench |
 | Frame-to-frame state leak through unflushed line buffers | Medium | High | Explicit flush FSM triggered on eop; testbench always runs ≥ 2 consecutive images |
+
+---
+
+## Step 7 — What to Build
+
+This section is the definitive build list. Every module is listed with its role,
+its ports, and its internal structure. Updated as decisions are made during implementation.
+
+---
+
+### Streaming interface (used everywhere between layers)
+
+Every connection between pipeline stages uses the same four signals:
+
+```
+valid  : std_logic                     -- producer: data on bus is valid this cycle
+ready  : std_logic                     -- consumer: I can accept data this cycle
+data   : std_logic_vector(7 downto 0)  -- uint8 activation value
+last   : std_logic                     -- last activation of this frame (end of image)
+```
+
+Data transfers only when `valid = 1` AND `ready = 1` simultaneously.
+`last` marks the final byte of a frame so downstream modules know when to flush.
+
+---
+
+### 7.1 Primitives
+
+These are standalone building blocks with no dependencies on other custom modules.
+
+---
+
+#### `requant_unit`
+Converts one int32 accumulator to one uint8 activation using fixed-point multiply + shift.
+
+```
+Inputs:
+  i_acc : signed(31 downto 0)    -- post-ReLU accumulator (>= 0)
+  i_m   : unsigned(31 downto 0)  -- per-channel multiplier
+  i_r   : unsigned(5 downto 0)   -- right-shift amount (0-63)
+
+Output:
+  o_q   : unsigned(7 downto 0)   -- requantised uint8
+
+Formula:  o_q = clip( round( (acc x m) >> r ), 0, 255 )
+Rounding: (acc x m + 2^(r-1)) >> r   (round-to-nearest, matches Python exactly)
+Combinational — no clock.
+```
+
+---
+
+#### `line_buffer`
+Holds K-1 complete rows so the conv layer can form its K×K sliding window.
+One pixel arrives per cycle. When enough rows are buffered, the sliding window
+is valid and MACs can fire.
+
+```
+Inputs:
+  clk    : std_logic
+  rst_n  : std_logic
+  i_data : std_logic_vector(7 downto 0)  -- one pixel per cycle
+  i_valid: std_logic
+
+Outputs:
+  o_window : array [K][K] of std_logic_vector(7 downto 0)  -- K×K pixel neighbourhood
+  o_valid  : std_logic                                      -- window is populated and ready
+
+Internals:
+  K-1 BRAM line buffers (one full row each, W pixels wide)
+  K shift registers (5 pixels wide for 5×5, 3 for 3×3) — one per row tap
+  Window is valid after K-1 full rows have been received
+```
+
+---
+
+#### `mac_array`
+Performs G_PAR_MACS parallel multiply-accumulate operations each cycle.
+One call per sliding window position computes G_PAR_MACS partial output channels.
+
+```
+Inputs:
+  clk      : std_logic
+  rst_n    : std_logic
+  i_window : array [K*K*C_IN] of signed(7 downto 0)   -- flattened pixel window (int8)
+  i_weights: array [G_PAR_MACS][K*K*C_IN] of signed(7 downto 0)  -- int8 weights
+  i_bias   : array [G_PAR_MACS] of signed(31 downto 0) -- int32 biases
+  i_valid  : std_logic                                  -- window is valid, fire MACs
+  i_last   : std_logic                                  -- last window of this output channel
+
+Outputs:
+  o_acc    : array [G_PAR_MACS] of signed(31 downto 0) -- int32 accumulators
+  o_valid  : std_logic                                  -- accumulators ready
+
+Generics:
+  G_PAR_MACS : positive   -- number of parallel MAC units
+  G_K        : positive   -- kernel size (3 or 5)
+  G_C_IN     : positive   -- input channels
+```
+
+---
+
+#### `weight_bram`
+Dual-port BRAM storing int8 weights and int32 biases for one layer.
+Port A feeds the MAC array. Port B is unused in V1 (tied off), available for
+runtime weight updates in V2.
+
+```
+Inputs:
+  clk      : std_logic
+  i_addr_a : unsigned   -- read address (from MAC array sequencer)
+
+Output:
+  o_data_a : std_logic_vector(7 downto 0)  -- int8 weight value, 1-cycle latency
+
+Generics:
+  G_DEPTH  : positive   -- number of weight entries
+  G_WIDTH  : positive   -- 8 for weights, 32 for biases
+Initialised from .mif file at synthesis time.
+```
+
+---
+
+#### `weight_fifo`
+Small BRAM FIFO that absorbs burst latency from the SDRAM controller.
+The MAC array reads from one side; sdram_ctrl writes to the other.
+
+```
+Inputs:
+  clk      : std_logic
+  -- write side (from sdram_ctrl)
+  i_wr_data: std_logic_vector(7 downto 0)
+  i_wr_en  : std_logic
+  -- read side (from MAC array)
+  i_rd_en  : std_logic
+
+Outputs:
+  o_rd_data: std_logic_vector(7 downto 0)
+  o_full   : std_logic
+  o_empty  : std_logic
+
+Generics:
+  G_DEPTH  : positive   -- sized to absorb worst-case SDRAM refresh (780 cycles)
+```
+
+---
+
+#### `argmax_unit`
+Scans the 10 int32 logits from FC8 and outputs the index of the largest value.
+
+```
+Inputs:
+  clk      : std_logic
+  i_data   : signed(31 downto 0)   -- one logit per cycle, streamed in
+  i_valid  : std_logic
+  i_last   : std_logic             -- last of the 10 logits
+
+Outputs:
+  o_class  : unsigned(3 downto 0)  -- winning class (0-9)
+  o_valid  : std_logic             -- result ready
+```
+
+---
+
+### 7.2 Layers
+
+Layers compose the primitives above. Each layer has exactly:
+- One streaming input  (`i_valid`, `i_ready`, `i_data`, `i_last`)
+- One streaming output (`o_valid`, `o_ready`, `o_data`, `o_last`)
+- Nothing else on the boundary in V1
+
+---
+
+#### `conv_layer`
+Generic convolution: line buffer → sliding window → MAC array → ReLU → requant → stream out.
+
+```
+Generics:
+  G_C_IN      : positive           -- input channels
+  G_C_OUT     : positive           -- output channels
+  G_H_IN      : positive           -- input height
+  G_W_IN      : positive           -- input width
+  G_KERNEL    : positive := 3      -- kernel size (3 or 5)
+  G_PADDING   : natural  := 1      -- zero-padding each side
+  G_PAR_MACS  : positive           -- parallel MAC units
+  G_WEIGHT_SRC: string   := "BRAM" -- "BRAM" or "SDRAM"
+
+Internals:
+  line_buffer    -- holds K-1 rows, taps sliding window
+  mac_array      -- G_PAR_MACS parallel MACs, fires when window valid
+  requant_unit   -- one instance per parallel MAC output
+  weight_bram    -- if G_WEIGHT_SRC = "BRAM"
+  weight_fifo    -- if G_WEIGHT_SRC = "SDRAM"
+```
+
+---
+
+#### `maxpool_layer`
+Generic 2×2 max pooling with stride 2. Buffers one row, compares with the next.
+
+```
+Generics:
+  G_CHANNELS : positive
+  G_W_IN     : positive
+  G_H_IN     : positive
+
+Internals:
+  row_buffer  -- holds one full input row (W x C bytes) while waiting for the next row
+  comparator  -- pixel-wise max across two rows and two columns
+```
+
+---
+
+#### `fc_layer`
+Generic fully connected layer. No sliding window — accumulates over all C_IN inputs
+sequentially then requantizes.
+
+```
+Generics:
+  G_C_IN      : positive
+  G_C_OUT     : positive
+  G_PAR_MACS  : positive
+  G_WEIGHT_SRC: string := "SDRAM"
+  G_LAST      : boolean := false   -- true for FC8 (no requant, raw int32 out)
+
+Internals:
+  mac_array      -- G_PAR_MACS parallel MACs
+  requant_unit   -- skipped if G_LAST = true
+  weight_bram or weight_fifo
+```
+
+---
+
+### 7.3 Memory & Control
+
+#### `sdram_ctrl`
+Streams weight data from external SDRAM into each layer's `weight_fifo`.
+One layer's weights at a time, in order, cycling through SDRAM-mapped layers.
+
+```
+Inputs:
+  clk, rst_n
+  i_fifo_full : std_logic   -- backpressure from the target layer's fifo
+
+Outputs:
+  -- SDRAM chip pins (IS42S16320F)
+  o_sdram_addr, o_sdram_ba, o_sdram_cas_n, o_sdram_ras_n, ...
+  -- data out to weight_fifo
+  o_fifo_data  : std_logic_vector(7 downto 0)
+  o_fifo_wr_en : std_logic
+```
+
+---
+
+#### `fpga_pipeline_top`
+Wires all layers together in order. No logic of its own — purely structural.
+
+```
+Inputs:
+  clk_100, rst_n
+  i_valid, i_data, i_last   -- pixel stream in
+
+Outputs:
+  o_class : unsigned(3 downto 0)  -- predicted class
+  o_valid : std_logic             -- result valid
+  -- SDRAM pins passed through to sdram_ctrl
+```
+
+---
+
+#### `pipeline_ctrl`
+Generates `i_last` and manages frame boundaries. Counts pixels, asserts `last`
+on the final pixel of each frame, flushes line buffers between frames.
+
+```
+Inputs:
+  clk, rst_n
+  i_valid : std_logic
+
+Outputs:
+  o_last  : std_logic   -- asserted on final pixel of each frame
+  o_flush : std_logic   -- tells line buffers to clear state
+```

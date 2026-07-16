@@ -574,7 +574,7 @@ interfaces, streaming CNN stages, external weight memory, and result path.
 
 <p align="center">
   <img
-    src="docs/fpga_pipeline_overview.svg"
+    src="../docs/fpga_pipeline_overview.svg"
     alt="Overall FPGA and HPS streaming CNN architecture"
     width="100%"
   />

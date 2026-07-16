@@ -567,6 +567,22 @@ RTL changes.
 
 ---
 
+### 5.1 Overall System Architecture
+
+The following diagram shows the complete data path between the HPS, FPGA memory
+interfaces, streaming CNN stages, external weight memory, and result path.
+
+<p align="center">
+  <img
+    src="docs/fpga_pipeline_overview.svg"
+    alt="Overall FPGA and HPS streaming CNN architecture"
+    width="100%"
+  />
+</p>
+
+
+---
+
 ### 5.1 Module Hierarchy
 
 ```

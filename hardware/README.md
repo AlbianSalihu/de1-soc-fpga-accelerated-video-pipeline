@@ -573,17 +573,22 @@ The following diagram shows the complete data path between the HPS, FPGA memory
 interfaces, streaming CNN stages, external weight memory, and result path.
 
 <p align="center">
-  <img
-    src="../docs/fpga_pipeline_overview.svg"
-    alt="Overall FPGA and HPS streaming CNN architecture"
-    width="100%"
-  />
+  <a href="https://raw.githubusercontent.com/AlbianSalihu/de1-soc-fpga-accelerated-video-pipeline/110baa942118c1e702a15baea3d05aff724acaef/docs/fpga_pipeline_overview.svg">
+    <img
+      src="../docs/fpga_pipeline_overview.svg"
+      alt="Overall FPGA and HPS streaming CNN architecture"
+      width="100%"
+    >
+  </a>
 </p>
 
+<p align="center">
+  <em>Click to open the full-size diagram.</em>
+</p>
 
 ---
 
-### 5.1 Module Hierarchy
+### 5.2 Module Hierarchy
 
 ```
 fpga_pipeline_top
@@ -655,7 +660,7 @@ fpga_pipeline_top
 
 ---
 
-### 5.2 Inter-Stage Streaming Interface (Avalon-ST)
+### 5.3 Inter-Stage Streaming Interface (Avalon-ST)
 
 Every connection between pipeline stages uses the same streaming interface.
 Data flows as one uint8 activation per cycle, one channel at a time, in row-major order.
@@ -678,7 +683,7 @@ asserts `window_valid` internally to gate the MAC array.
 
 ---
 
-### 5.3 Layer Generics
+### 5.4 Layer Generics
 
 **conv_layer**
 ```vhdl
@@ -720,7 +725,7 @@ entity fc_layer is
 
 ---
 
-### 5.4 Sub-Module Interfaces
+### 5.5 Sub-Module Interfaces
 
 **line_buffer**
 ```
@@ -749,7 +754,7 @@ Outputs: avmm_addr/read/rddata/rdvalid/waitreq,  fifo_data, fifo_wr_en, fifo_ful
 
 ---
 
-### 5.5 Top-Level Port Map
+### 5.6 Top-Level Port Map
 
 ```
 Inputs:
@@ -775,7 +780,7 @@ Outputs:
 
 ---
 
-### 5.6 Planned RTL File Layout
+### 5.7 Planned RTL File Layout
 
 ```
 hardware/rtl/
@@ -800,7 +805,7 @@ hardware/rtl/
 
 ---
 
-### 5.7 V1/V2 Modularity Strategy
+### 5.8 V1/V2 Modularity Strategy
 
 The architecture is designed so that v2 improvements — HPS offload, dynamic weight loading,
 master control — require **wiring changes at the top level only**. No layer module is

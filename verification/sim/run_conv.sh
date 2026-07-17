@@ -68,5 +68,13 @@ run_testbench \
     "verification/tb/conv/tb_conv_layer_weight_filling.vhd" \
     "tb_conv_layer_weight_filling"
 
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_prime_weight_concurrent.vhd" \
+    "tb_conv_layer_prime_weight_concurrent"
+
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_calculation.vhd" \
+    "tb_conv_layer_calculation"
+
 echo
 echo "All convolution testbenches passed."

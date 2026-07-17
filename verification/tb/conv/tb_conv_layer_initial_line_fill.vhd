@@ -50,7 +50,9 @@ begin
 
             i_weight_valid => '0',
             o_weight_ready => open,
-            i_weight_data  => (others => '0')
+            i_weight_data  => (others => '0'),
+            o_acc_valid => open,
+            o_acc_data  => open
         );
 
 

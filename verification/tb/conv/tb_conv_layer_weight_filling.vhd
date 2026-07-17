@@ -56,7 +56,9 @@ begin
 
             i_weight_valid => i_weight_valid,
             o_weight_ready => o_weight_ready,
-            i_weight_data  => i_weight_data
+            i_weight_data  => i_weight_data,
+            o_acc_valid => open,
+            o_acc_data  => open
         );
 
 

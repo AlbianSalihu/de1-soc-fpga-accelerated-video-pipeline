@@ -19,7 +19,10 @@ entity conv_layer is
 
         i_weight_valid : in std_logic; 
         o_weight_ready : out std_logic;
-        i_weight_data : in std_logic_vector(7 downto 0)
+        i_weight_data : in std_logic_vector(7 downto 0);
+
+        o_acc_valid : out std_logic;
+        o_acc_data : out std_logic_vector(G_C_PAR * 32 - 1 downto 0)    
     );
 end entity conv_layer;
 
@@ -39,7 +42,9 @@ architecture rtl of conv_layer is
     constant C_LINE_SIZE : positive := G_W_IN * G_C_IN;
     constant C_INITIAL_FILL_SIZE : positive := (G_KERNEL - 1) * C_LINE_SIZE;
     constant C_PRIME_FILL_SIZE : positive := G_KERNEL * G_C_IN;
-    constant C_WEIGHT_FILL_SIZE : positive := G_C_PAR * G_KERNEL * G_KERNEL;
+    constant C_KERNEL_SIZE : positive := G_KERNEL * G_KERNEL;
+    constant C_WEIGHT_FILL_SIZE : positive := G_C_PAR * C_KERNEL_SIZE;
+    
 
     type t_weight_buffer is array(
         0 to C_WEIGHT_FILL_SIZE - 1
@@ -50,8 +55,12 @@ architecture rtl of conv_layer is
         0 to C_LINE_SIZE - 1
     ) of std_logic_vector(7 downto 0);
 
-    signal weight_buffer : t_weight_buffer;
+    type t_accumulator_array is array (
+        0 to G_C_PAR - 1
+    ) of signed(31 downto 0);
 
+    signal weight_buffer : t_weight_buffer;
+    signal accumulators : t_accumulator_array;
     signal weight_fill_active : std_logic := '0';
     signal weight_group_ready : std_logic := '0';
     signal weight_accepted : std_logic;
@@ -81,10 +90,18 @@ architecture rtl of conv_layer is
 
     signal line_buffer_wr_addr : natural range 0 to C_LINE_SIZE - 1 := 0;
 
+    signal calculation_active : std_logic := '0';
+    signal calculation_done : std_logic := '0';
+
+    signal calculation_waiting_for_weights : std_logic := '0';
+    signal calculation_kernel_count : natural range 0 to C_KERNEL_SIZE - 1 := 0; 
+    signal calculation_channel_count : natural range 0 to G_C_IN - 1 := 0;
+    signal weight_refill_request : std_logic := '0';
+
 begin
 
     start_line_fill   <= '1' when state = S_IDLE else '0';
-    start_weight_fill <= '1' when state = S_IDLE else '0';
+    start_weight_fill <= '1' when state = S_IDLE or weight_refill_request = '1' else '0';
 
     start_prime_k_line <= initial_line_fill_done;
 
@@ -100,6 +117,12 @@ begin
 
     o_weight_ready <= weight_fill_active;
     weight_accepted <= i_weight_valid and weight_fill_active;
+    o_acc_valid <= calculation_done;
+
+    accumulator_output_generate : 
+    for lane in 0 to G_C_PAR - 1 generate
+        o_acc_data((lane + 1) * 32 - 1 downto lane * 32) <= std_logic_vector(accumulators(lane));
+    end generate;
 
     controller_process : process(clk)
     begin
@@ -124,7 +147,9 @@ begin
                         end if;
 
                     when S_CALC_AND_SLIDING_WINDOW =>
-                        null;
+                        if calculation_done = '1' then
+                            state <= S_STREAM_LINE_FILLING;    
+                        end if;
 
                     when S_STREAM_LINE_FILLING =>
                         null;
@@ -235,6 +260,85 @@ begin
                         else
                             weight_fill_count <= weight_fill_count + 1;
                         end if;
+                    end if;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    calculation_process : process(clk)
+        variable v_row : natural;
+        variable v_col : natural;
+        variable v_line_addr : natural;
+        variable v_weight_addr : natural;
+        
+        variable v_activation : signed(8 downto 0);
+        variable v_product : signed(16 downto 0);
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then 
+                calculation_active <= '0';
+                calculation_done <= '0';
+                calculation_waiting_for_weights <= '0';
+                calculation_kernel_count <= 0;
+                calculation_channel_count <= 0;
+                weight_refill_request <= '0';
+                for lane in 0 to G_C_PAR - 1 loop 
+                    accumulators(lane) <= (others => '0');
+                end loop;
+            else
+                weight_refill_request <= '0';
+
+                if state /= S_CALC_AND_SLIDING_WINDOW Then
+                    calculation_active <= '0';
+                    calculation_done <= '0';
+                    calculation_waiting_for_weights <= '0';
+                    calculation_kernel_count <= 0;
+                    calculation_channel_count <= 0;
+                elsif  calculation_done = '0' then
+                    if calculation_waiting_for_weights = '1' then
+                        if weight_group_ready = '1' and weight_fill_active = '0' and weight_refill_request = '0' then
+                            calculation_waiting_for_weights <= '0';
+                            calculation_active <= '1';
+                            calculation_kernel_count <= 0;
+                        end if;
+                    elsif calculation_active = '0' then
+                        calculation_active <= '1';
+                        calculation_kernel_count <= 0;
+                        calculation_channel_count <= 0;
+                        
+                        for lane in 0 to G_C_PAR - 1 loop
+                            accumulators(lane) <= (others => '0');
+                        end loop;
+                    else
+                        v_row := calculation_kernel_count / G_KERNEL;
+                        v_col := calculation_kernel_count mod G_KERNEL; 
+
+                        v_line_addr := v_col * G_C_IN + calculation_channel_count;
+
+                        v_activation := signed('0' & line_buffer(v_row,v_line_addr));
+
+                        for lane in 0 to G_C_PAR - 1 loop
+                            v_weight_addr := lane * C_KERNEL_SIZE + calculation_kernel_count;
+                            v_product := v_activation * weight_buffer(v_weight_addr);
+                            accumulators(lane)<=accumulators(lane) + resize(v_product, 32);
+                        end loop;
+
+                        if calculation_kernel_count = C_KERNEL_SIZE - 1 then
+                            calculation_kernel_count <= 0;
+
+                            if calculation_channel_count = G_C_IN -1 then
+                                calculation_active <= '0';
+                                calculation_done <= '1';
+                            else
+                                calculation_active <= '0';
+                                calculation_channel_count <= calculation_channel_count + 1;
+                                calculation_waiting_for_weights <= '1';
+                                weight_refill_request <= '1';
+                            end if;
+                        else
+                            calculation_kernel_count <= calculation_kernel_count + 1;
+                        end if; 
                     end if;
                 end if;
             end if;

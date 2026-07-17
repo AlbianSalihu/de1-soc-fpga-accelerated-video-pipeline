@@ -1,172 +1,343 @@
-# conv_layer
+# `conv_layer`
 
-Generic convolutional layer for the FPGA inference pipeline.
+Generic streaming convolution layer for the FPGA inference pipeline.
+
+> **Status:** architectural draft.  
+> The controller schedule is defined at a high level, but the external interface,
+> exact cycle timing, and datapath details are still being finalized.
 
 ---
 
 ## Role
 
-Performs one convolution + ReLU + requantisation stage of the CNN.
-Accepts a streaming pixel input, produces a streaming activation output.
-Fully self-contained — no external control signals, no external weight bus in V1.
+`conv_layer` performs one quantized convolution stage:
+
+```text
+uint8 activations
+    ↓
+int8 convolution weights
+    ↓
+int32 accumulation
+    ↓
+bias + ReLU + fixed-point requantisation
+    ↓
+uint8 output activations
+```
+
+The same generic layer is intended to support all convolution stages by changing
+its dimensions, kernel size, channel counts, padding, and parallelism parameters.
+
+The architecture is designed around continuous streaming:
+
+- incoming activations fill line buffers;
+- convolution starts as soon as the first complete window is available;
+- the next activation line continues filling while the current rows are processed;
+- weights are loaded independently and synchronized with activation readiness;
+- physical line-buffer contents are not copied during rotation—only their roles change.
+
+---
+
+## Current design decisions
+
+### Activation buffering
+
+For a `K × K` convolution window, the controller keeps:
+
+- `K` active activation rows used by the convolution;
+- one spare row buffer receiving the next activation line.
+
+For `K = 3`, the physical roles are therefore:
+
+```text
+three active row buffers
+one spare write buffer
+```
+
+After one output row is complete, the oldest active buffer is released and becomes
+the next spare write buffer.
+
+### Weight handling
+
+The convolution datapath receives weights through a common weight-stream abstraction.
+
+The source may be:
+
+- local FPGA BRAM initialized at configuration time; or
+- a FIFO filled from external FPGA SDRAM.
+
+The convolution controller should not depend on which source is selected.
+
+The active working set is currently defined as:
+
+```text
+C_PAR × K × K weights
+```
+
+where `C_PAR` is the number of input-channel contributions processed in parallel.
+
+### Accumulation
+
+Activations are unsigned 8-bit values, weights are signed 8-bit values, and partial
+sums use signed 32-bit accumulators.
+
+Bias is used to initialize the accumulator for an output value. Contributions from
+successive input-channel groups are then added until the output is complete.
+
+The exact accumulator-bank organization is still to be finalized because it depends
+on the final output-channel and weight-group loop order.
 
 ---
 
 ## Interface
 
-```
-Generics:
-  G_C_IN      : positive           -- input channels
-  G_C_OUT     : positive           -- output channels
-  G_H_IN      : positive           -- input height (pixels)
-  G_W_IN      : positive           -- input width  (pixels)
-  G_KERNEL    : positive := 3      -- kernel size (3 or 5)
-  G_PADDING   : natural  := 1      -- zero-padding each side
-  G_PAR_MACS  : positive           -- parallel MAC units (= parallel output channels)
-  G_USE_BRAM  : boolean  := true   -- weights stored in BRAM (false = SDRAM-fed FIFO)
-  G_USE_REGS  : boolean  := false  -- line buffers in registers instead of BRAM (use for small layers e.g. Conv1)
+The external interface is intentionally left undefined for now.
 
-Ports:
-  clk     : in  std_logic
-  rst_n   : in  std_logic
+The final entity is expected to include:
 
-  -- streaming input (from previous layer or top-level)
-  i_valid : in  std_logic
-  i_ready : out std_logic                       -- backpressure to upstream
-  i_data  : in  std_logic_vector(7 downto 0)   -- uint8 activation (channel-last)
-  i_last  : in  std_logic                       -- last byte of frame
+- clock and reset;
+- ready/valid activation input;
+- ready/valid activation output;
+- ready/valid weight input;
+- frame or tensor boundary information;
+- generics for tensor dimensions, kernel size, padding, stride, and parallelism.
 
-  -- streaming output (to next layer)
-  o_valid : out std_logic
-  o_ready : in  std_logic                       -- backpressure from downstream
-  o_data  : out std_logic_vector(7 downto 0)   -- uint8 activation (channel-last)
-  o_last  : out std_logic                       -- last byte of frame
+Exact signal names, widths, sideband fields, and tensor ordering will be defined only
+after the controller schedule and datapath are validated in simulation.
+
+---
+
+## Controller state machine
+
+The current controller is represented as a concurrent statechart. Several states may
+remain active as independent operations progress, allowing activation filling, weight
+movement, and convolution work to overlap.
+
+<p align="center">
+  <a href="State_Machine_conv.svg">
+    <img
+      src="State_Machine_conv.svg"
+      alt="Generic convolution-layer controller state machine"
+      width="100%"
+    >
+  </a>
+</p>
+
+<p align="center">
+  <em>Click the diagram to open the full-size SVG.</em>
+</p>
+
+> The path above assumes:
+>
+> ```text
+> docs/
+> ├── diagrams/conv_controller_fsm.svg
+> └── modules/conv_layer.md
+> ```
+>
+> Adjust the relative path if this document is stored elsewhere.
+
+---
+
+## State-machine behavior
+
+### `IDLE`
+
+Waits for the start of a new activation tensor.
+
+The transition out of `IDLE` starts two independent preparation paths:
+
+```text
+initial activation-line filling
+            ||
+initial weight filling
 ```
 
 ---
 
-## Data format
+### `INITIAL LINE FILL`
 
-Pixels arrive **channel-last**:
+Fills the first `K - 1` complete activation lines.
 
+```text
+remain in state while:
+    nb_full_line < K - 1
+
+leave state when:
+    nb_full_line = K - 1
 ```
-(row=0, col=0, ch=0), (row=0, col=0, ch=1), ..., (row=0, col=0, ch=C_IN-1),
-(row=0, col=1, ch=0), ...
-```
 
-One byte per clock cycle when `i_valid = 1` and `i_ready = 1`.
+No convolution can begin yet because the `K`th row is not sufficiently available.
 
 ---
 
-## Internal structure
+### `PRIME Kth LINE`
 
-```
-i_data
-  │
-  ▼
-┌─────────────────┐
-│   line_buffer   │  holds K rows (BRAM/registers)
-│  + shift regs   │  holds K pixels per row tap (registers)
-└────────┬────────┘
-         │  K×K×C_IN window (valid signal)
-         ▼
-┌─────────────────┐
-│    mac_array    │  G_PAR_MACS parallel MACs
-│                 │  fires once per window position per output channel group
-└────────┬────────┘
-         │  G_PAR_MACS int32 accumulators
-         ▼
-┌─────────────────┐
-│  requant_unit   │  G_PAR_MACS instances in parallel
-│  (x G_PAR_MACS) │  clip( round( acc × m >> r ), 0, 255 )
-└────────┬────────┘
-         │  G_PAR_MACS uint8 values
-         ▼
-       o_data (streamed out one byte at a time)
+Fills the first `K` columns of the `K`th activation line.
+
+```text
+remain in state while:
+    nb_column < K
+
+first window ready when:
+    nb_column >= K
 ```
 
-Weights and biases live internally in `weight_bram` (G_WEIGHT_SRC="BRAM")
-or are fed from `weight_fifo` filled by `sdram_ctrl` (G_WEIGHT_SRC="SDRAM").
+At this point, the first `K × K` activation window exists, even though the `K`th line
+has not yet been filled completely.
 
 ---
 
-## Internal FSM
+### `WEIGHT FILLING`
 
-The main counters drive stream position and output-channel grouping:
+Loads one active weight group:
 
-```
-row_cnt : 0 → G_H_IN + G_PADDING - 1
-col_cnt : 0 → G_W_IN + G_PADDING - 1
-ch_cnt  : 0 → G_C_IN - 1
-out_grp : 0 → G_C_OUT / G_PAR_MACS - 1
+```text
+C_PAR × K × K weights
 ```
 
-### States
+The state remains active until the complete group is available, then asserts:
 
-**S_INIT**
-- Accept initial real input pixels.
-- Fill the current-row shift register and circular line buffer.
-- Start computing as soon as padding makes a window valid:
-  `row_cnt >= G_KERNEL - 1 - G_PADDING` and
-  `col_cnt >= G_KERNEL - 1 - G_PADDING`.
+```text
+weights_ready
+```
 
-**S_STEADY**
-- Accept real input pixels while `row_cnt < G_H_IN` and `col_cnt < G_W_IN`.
-- Hold `i_ready = 0` while generating right/bottom virtual zero-padding
-  coordinates after the real image edge.
-- Transition to `S_COMPUTE` for every valid output pixel coordinate.
-
-**S_COMPUTE**
-- Window is valid and all C_IN channels of the current real or virtual pixel
-  coordinate are available.
-- Pull `i_ready = 0` while MAC/output work is in progress.
-- Iterate `out_grp` from 0 to G_C_OUT/G_PAR_MACS - 1:
-  - Walk all `G_KERNEL * G_KERNEL * G_C_IN` MAC positions.
-  - Accumulate into `G_PAR_MACS` parallel output channels.
-  - Apply ReLU + requant.
-  - Stream `G_PAR_MACS` bytes one byte at a time.
-- Transition back to `S_STEADY` after all output channel groups for the
-  current output pixel have been emitted.
-
-**S_FLUSH**
-- Reached after the final padded output coordinate has been emitted.
-- Reset `row_cnt`, `col_cnt`, `ch_cnt`, `out_grp` to 0
-- Transition → `S_INIT`
+Weight filling begins independently from activation-line filling.
 
 ---
 
-## Timing
+### Calculation join
 
-One output pixel (all G_C_OUT channels) takes:
+The horizontal convolution sweep begins only when both sides are ready:
 
+```text
+first_window_ready
+AND
+weights_ready
 ```
-G_C_OUT / G_PAR_MACS  cycles  (one cycle per output group)
-```
 
-Input is stalled during this time via backpressure (`i_ready = 0`).
-
-For Conv1 (G_C_OUT=64, G_PAR_MACS=2):  32 stall cycles per output pixel
-For Conv4 (G_C_OUT=256, G_PAR_MACS=73): 4 stall cycles per output pixel
+Using a latched `first_window_ready` condition is safer than testing only
+`nb_column = K`, because activation filling may advance beyond column `K` while
+waiting for weights.
 
 ---
 
-## Notes
+### `CALCULATION AND SLIDING WINDOW`
 
-- ReLU is applied as `clamp(acc, min=0)` on the int32 accumulator before requant —
-  it is not a separate module
-- Top/left zero-padding is handled by treating out-of-bounds window positions
-  as zero during MAC reads.
-- Right/bottom zero-padding is generated internally after the real image edge
-  while holding `i_ready = 0`; upstream does not send explicit pad bytes.
-- Activations are consumed as uint8 values (`0..255`) and multiplied by int8
-  weights. The MAC path zero-extends activation bytes to 9-bit signed before
-  multiplying so values above 127 are not interpreted as negative.
-- The line buffer has `G_KERNEL` rows, not `G_KERNEL - 1`, because the current
-  input row is written immediately and must not overwrite the oldest row still
-  needed by a padded `K x K` window.
-- G_PAR_MACS must divide G_C_OUT exactly
-- The same conv_layer entity is used for all five conv layers — only the generic
-  map changes at the top level
-- G_USE_REGS=true is only practical for small line buffers.
-  For larger layers (Conv2-5) always use G_USE_REGS=false (BRAM).
-  The compute logic is identical either way — only the line buffer storage changes.
+Uses the active `K × K × C_PAR` activation window and matching weights.
+
+During the horizontal pass:
+
+```text
+calculate current window
+    ↓
+advance the activation window by one column
+    ↓
+repeat until the horizontal sweep is complete
+```
+
+The active weight group remains fixed during one horizontal sweep. The activation
+window moves across the row.
+
+At the end of the sweep:
+
+- if more weight groups are required, return to `WEIGHT FILLING` and sweep the same
+  active rows again;
+- if the final required weight group is complete, wait for the next activation line
+  to be ready before rotating the line-buffer roles.
+
+---
+
+### `STREAM LINE FILLING`
+
+Runs concurrently with the horizontal convolution sweep.
+
+It first completes the partially filled `K`th line, then continues writing the next
+activation line into the spare row buffer.
+
+```text
+finish current line
+    ↓
+select spare row buffer
+    ↓
+fill next line
+```
+
+The stream-filling path stops when the spare row buffer contains one complete line.
+
+---
+
+### `LINE ROTATION`
+
+Entered when both conditions are satisfied:
+
+```text
+all required horizontal sweeps for the current row are complete
+AND
+the next activation line is completely filled
+```
+
+The state changes buffer roles only; it does not copy activation data.
+
+For `K = 3`:
+
+```text
+before rotation:
+    active rows = A, B, C
+    spare row   = D
+
+after rotation:
+    active rows = B, C, D
+    spare row   = A
+```
+
+The horizontal position is reset, and the released oldest row becomes the next write
+buffer.
+
+---
+
+### End of tensor
+
+After the final output row and final weight group are complete, the controller drains
+any remaining output data and returns to `IDLE`.
+
+The exact final-state and output-handshake behavior will be defined with the external
+interface.
+
+---
+
+## Open design points
+
+The following items are intentionally not fixed yet:
+
+- exact VHDL entity and port list;
+- activation tensor ordering and transfer width;
+- exact definition of `C_PAR`;
+- output-channel parallelism;
+- accumulator-bank size and addressing;
+- padding and stride scheduling;
+- local-BRAM versus external-FIFO weight adapters;
+- output serialization and backpressure behavior;
+- end-of-frame and pipeline-drain handling.
+
+These decisions will be made incrementally while building `conv.vhd` and its
+testbenches.
+
+---
+
+## Verification plan
+
+Implementation should proceed in small, independently verified steps:
+
+1. verify filling of the first `K - 1` complete lines;
+2. verify priming of the first `K` columns of the `K`th line;
+3. verify one `C_PAR × K × K` weight-group load;
+4. verify the activation-ready and weight-ready join;
+5. verify one horizontal window sweep;
+6. verify simultaneous line filling and calculation;
+7. verify line-buffer role rotation;
+8. verify repeated weight-group sweeps and accumulation;
+9. verify a complete small convolution against a software reference;
+10. add padding, requantisation, output streaming, and backpressure.
+
+The first testbenches should use very small tensors so every line-buffer write,
+weight load, window position, and accumulator value can be inspected directly.

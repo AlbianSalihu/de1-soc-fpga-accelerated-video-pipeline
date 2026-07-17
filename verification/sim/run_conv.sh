@@ -6,11 +6,12 @@ BUILD_DIR="verification/sim/build/conv"
 RESULT_DIR="verification/results/directed/conv"
 
 RTL_FILE="hardware/rtl/layers/conv_layer.vhd"
-TB_FILE="verification/tb/conv/tb_conv_layer_initial_line_fill.vhd"
-TB_ENTITY="tb_conv_layer_initial_line_fill"
+TB_PACKAGE="verification/tb/conv/conv_tb_pkg.vhd"
 
-mkdir -p "$BUILD_DIR"
 mkdir -p "$RESULT_DIR"
+
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
 
 echo "Analyzing conv_layer..."
 ghdl -a \
@@ -18,25 +19,50 @@ ghdl -a \
     --workdir="$BUILD_DIR" \
     "$RTL_FILE"
 
-echo "Analyzing $TB_ENTITY..."
+echo "Analyzing shared testbench package..."
 ghdl -a \
     --std=08 \
     --workdir="$BUILD_DIR" \
-    "$TB_FILE"
+    "$TB_PACKAGE"
 
-echo "Elaborating $TB_ENTITY..."
-ghdl -e \
-    --std=08 \
-    --workdir="$BUILD_DIR" \
-    "$TB_ENTITY"
 
-echo "Running $TB_ENTITY..."
-ghdl -r \
-    --std=08 \
-    --workdir="$BUILD_DIR" \
-    "$TB_ENTITY" \
-    --assert-level=error \
-    --wave="$RESULT_DIR/tb_conv_layer_initial_line_fill.ghw"
+run_testbench() {
+    local tb_file="$1"
+    local tb_entity="$2"
 
-echo "Simulation completed successfully."
-echo "Waveform: $RESULT_DIR/tb_conv_layer_initial_line_fill.ghw"
+    echo
+    echo "Analyzing $tb_entity..."
+
+    ghdl -a \
+        --std=08 \
+        --workdir="$BUILD_DIR" \
+        "$tb_file"
+
+    echo "Elaborating $tb_entity..."
+
+    ghdl -e \
+        --std=08 \
+        --workdir="$BUILD_DIR" \
+        "$tb_entity"
+
+    echo "Running $tb_entity..."
+
+    ghdl -r \
+        --std=08 \
+        --workdir="$BUILD_DIR" \
+        "$tb_entity" \
+        --assert-level=error \
+        --wave="$RESULT_DIR/$tb_entity.ghw"
+}
+
+
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_initial_line_fill.vhd" \
+    "tb_conv_layer_initial_line_fill"
+
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_prime_k_line.vhd" \
+    "tb_conv_layer_prime_k_line"
+
+echo
+echo "All convolution testbenches passed."

@@ -32,14 +32,11 @@ architecture rtl of conv_layer is
 
     signal state : conv_states := S_IDLE;
 
-    constant C_LINE_SIZE : positive :=
-        G_W_IN * G_C_IN;
+    constant C_LINE_SIZE : positive := G_W_IN * G_C_IN;
 
-    constant C_INITIAL_FILL_SIZE : positive :=
-        (G_KERNEL - 1) * C_LINE_SIZE;
+    constant C_INITIAL_FILL_SIZE : positive := (G_KERNEL - 1) * C_LINE_SIZE;
 
-    constant C_PRIME_FILL_SIZE : positive :=
-        G_KERNEL * G_C_IN;
+    constant C_PRIME_FILL_SIZE : positive := G_KERNEL * G_C_IN;
 
     type t_line_buffer is array (
         0 to G_KERNEL,
@@ -48,31 +45,27 @@ architecture rtl of conv_layer is
 
     signal line_buffer : t_line_buffer;
 
-    signal start_line_fill    : std_logic;
-    signal start_weight_fill  : std_logic;
+    signal start_line_fill : std_logic;
+    signal start_weight_fill : std_logic;
     signal start_prime_k_line : std_logic;
 
     signal activation_accepted : std_logic;
 
-    signal initial_fill_active    : std_logic := '0';
+    signal initial_fill_active : std_logic := '0';
     signal initial_line_fill_done : std_logic := '0';
 
-    signal initial_fill_count :
-        natural range 0 to C_INITIAL_FILL_SIZE - 1 := 0;
+    signal initial_fill_count : natural range 0 to C_INITIAL_FILL_SIZE - 1 := 0;
 
     signal prime_k_line_active : std_logic := '0';
-    signal first_window_ready  : std_logic := '0';
+    signal first_window_ready : std_logic := '0';
 
-    signal prime_fill_count :
-        natural range 0 to C_PRIME_FILL_SIZE - 1 := 0;
+    signal prime_fill_count : natural range 0 to C_PRIME_FILL_SIZE - 1 := 0;
 
     signal line_buffer_we : std_logic;
 
-    signal line_buffer_wr_row :
-        natural range 0 to G_KERNEL := 0;
+    signal line_buffer_wr_row : natural range 0 to G_KERNEL := 0;
 
-    signal line_buffer_wr_addr :
-        natural range 0 to C_LINE_SIZE - 1 := 0;
+    signal line_buffer_wr_addr : natural range 0 to C_LINE_SIZE - 1 := 0;
 
 begin
 
@@ -83,21 +76,13 @@ begin
 
     i_ready <= initial_fill_active or prime_k_line_active;
 
-    activation_accepted <=
-        i_valid and (initial_fill_active or prime_k_line_active);
+    activation_accepted <= i_valid and (initial_fill_active or prime_k_line_active);
 
     line_buffer_we <= activation_accepted;
 
-    line_buffer_wr_row <=
-        initial_fill_count / C_LINE_SIZE
-        when initial_fill_active = '1'
-        else G_KERNEL - 1;
+    line_buffer_wr_row <= initial_fill_count / C_LINE_SIZE when initial_fill_active = '1' else G_KERNEL - 1;
 
-    line_buffer_wr_addr <=
-        initial_fill_count mod C_LINE_SIZE
-        when initial_fill_active = '1'
-        else prime_fill_count;
-
+    line_buffer_wr_addr <= initial_fill_count mod C_LINE_SIZE when initial_fill_active = '1' else prime_fill_count;
 
     controller_process : process(clk)
     begin
@@ -141,29 +126,24 @@ begin
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
-                initial_fill_active    <= '0';
+                initial_fill_active <= '0';
                 initial_line_fill_done <= '0';
-                initial_fill_count     <= 0;
+                initial_fill_count <= 0;
 
             else
                 initial_line_fill_done <= '0';
-
                 if start_line_fill = '1' then
                     initial_fill_active <= '1';
-                    initial_fill_count  <= 0;
+                    initial_fill_count <= 0;
 
                 elsif initial_fill_active = '1' then
                     if activation_accepted = '1' then
-
-                        if initial_fill_count =
-                           C_INITIAL_FILL_SIZE - 1 then
-
-                            initial_fill_active    <= '0';
+                        if initial_fill_count = C_INITIAL_FILL_SIZE - 1 then
+                            initial_fill_active <= '0';
                             initial_line_fill_done <= '1';
 
                         else
-                            initial_fill_count <=
-                                initial_fill_count + 1;
+                            initial_fill_count <= initial_fill_count + 1;
                         end if;
 
                     end if;
@@ -178,27 +158,24 @@ begin
         if rising_edge(clk) then
             if rst_n = '0' then
                 prime_k_line_active <= '0';
-                first_window_ready  <= '0';
-                prime_fill_count    <= 0;
+                first_window_ready <= '0';
+                prime_fill_count <= 0;
 
             else
                 if start_prime_k_line = '1' then
                     prime_k_line_active <= '1';
-                    first_window_ready  <= '0';
-                    prime_fill_count    <= 0;
+                    first_window_ready <= '0';
+                    prime_fill_count <= 0;
 
                 elsif prime_k_line_active = '1' then
                     if activation_accepted = '1' then
 
-                        if prime_fill_count =
-                           C_PRIME_FILL_SIZE - 1 then
-
+                        if prime_fill_count = C_PRIME_FILL_SIZE - 1 then
                             prime_k_line_active <= '0';
                             first_window_ready  <= '1';
 
                         else
-                            prime_fill_count <=
-                                prime_fill_count + 1;
+                            prime_fill_count <= prime_fill_count + 1;
                         end if;
 
                     end if;
@@ -212,10 +189,7 @@ begin
     begin
         if rising_edge(clk) then
             if line_buffer_we = '1' then
-                line_buffer(
-                    line_buffer_wr_row,
-                    line_buffer_wr_addr
-                ) <= i_data;
+                line_buffer(line_buffer_wr_row, line_buffer_wr_addr) <= i_data;
             end if;
         end if;
     end process;

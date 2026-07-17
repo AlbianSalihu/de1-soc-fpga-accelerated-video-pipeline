@@ -6,11 +6,11 @@ use std.env.all;
 
 use work.conv_tb_pkg.all;
 
-entity tb_conv_layer_initial_line_fill is
-end entity tb_conv_layer_initial_line_fill;
+entity tb_conv_layer_prime_k_line is
+end entity tb_conv_layer_prime_k_line;
 
 
-architecture sim of tb_conv_layer_initial_line_fill is
+architecture sim of tb_conv_layer_prime_k_line is
 
     constant C_CLK_PERIOD : time := 10 ns;
 
@@ -20,6 +20,9 @@ architecture sim of tb_conv_layer_initial_line_fill is
 
     constant C_INITIAL_FILL_SIZE : positive :=
         (C_KERNEL - 1) * C_W_IN * C_C_IN;
+
+    constant C_PRIME_FILL_SIZE : positive :=
+        C_KERNEL * C_C_IN;
 
     signal clk   : std_logic := '0';
     signal rst_n : std_logic := '0';
@@ -76,12 +79,58 @@ begin
         wait for 1 ns;
 
         assert i_ready = '0'
+            report "FAIL: initial line filling did not complete."
+            severity failure;
+
+        wait until rising_edge(clk);
+        wait for 1 ns;
+
+        assert i_ready = '1'
+            report "FAIL: PRIME_K_LINE did not start."
+            severity failure;
+
+        send_activation_byte(
+            p_clk   => clk,
+            p_valid => i_valid,
+            p_ready => i_ready,
+            p_data  => i_data,
+            p_value => 8
+        );
+
+        wait for 1 ns;
+
+        assert i_ready = '1'
+            report "FAIL: PRIME_K_LINE stopped after one byte."
+            severity failure;
+
+        i_valid <= '0';
+
+        wait until rising_edge(clk);
+        wait for 1 ns;
+
+        assert i_ready = '1'
             report
-                "FAIL: initial line filling did not stop after the expected number of bytes."
+                "FAIL: PRIME_K_LINE changed state during an invalid cycle."
+            severity failure;
+
+        send_activation_range(
+            p_clk         => clk,
+            p_valid       => i_valid,
+            p_ready       => i_ready,
+            p_data        => i_data,
+            p_first_value => 9,
+            p_count       => C_PRIME_FILL_SIZE - 1
+        );
+
+        wait for 1 ns;
+
+        assert i_ready = '0'
+            report
+                "FAIL: PRIME_K_LINE did not stop after the expected number of bytes."
             severity failure;
 
         report
-            "PASS: S_INITIAL_LINE_FILL accepted exactly eight bytes."
+            "PASS: S_INITIAL_LINE_FILL transitioned correctly to S_PRIME_K_LINE."
             severity note;
 
         stop;

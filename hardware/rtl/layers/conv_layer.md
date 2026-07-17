@@ -126,16 +126,6 @@ movement, and convolution work to overlap.
   <em>Click the diagram to open the full-size SVG.</em>
 </p>
 
-> The path above assumes:
->
-> ```text
-> docs/
-> ├── diagrams/conv_controller_fsm.svg
-> └── modules/conv_layer.md
-> ```
->
-> Adjust the relative path if this document is stored elsewhere.
-
 ---
 
 ## State-machine behavior

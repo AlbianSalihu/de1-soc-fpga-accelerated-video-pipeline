@@ -37,14 +37,20 @@ begin
         generic map (
             G_C_IN   => C_C_IN,
             G_W_IN   => C_W_IN,
+            G_C_PAR  => 2,
             G_KERNEL => C_KERNEL
         )
         port map (
-            clk     => clk,
-            rst_n   => rst_n,
-            i_valid => i_valid,
-            i_ready => i_ready,
-            i_data  => i_data
+            clk            => clk,
+            rst_n          => rst_n,
+
+            i_valid        => i_valid,
+            i_ready        => i_ready,
+            i_data         => i_data,
+
+            i_weight_valid => '0',
+            o_weight_ready => open,
+            i_weight_data  => (others => '0')
         );
 
 

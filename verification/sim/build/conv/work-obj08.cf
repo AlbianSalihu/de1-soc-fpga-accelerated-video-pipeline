@@ -1,13 +1,16 @@
 v 4
-file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "verification/tb/conv/tb_conv_layer_prime_k_line.vhd" "e036c483ca85dd5410702814ede4898c9fe49a90" "20260717123556.771":
-  entity tb_conv_layer_prime_k_line at 1( 0) + 0 on 17;
-  architecture sim of tb_conv_layer_prime_k_line at 13( 180) + 0 on 18;
-file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "verification/tb/conv/conv_tb_pkg.vhd" "8765bc5a86960df5fc448363eaaded434120a48c" "20260717123556.568":
-  package conv_tb_pkg at 1( 0) + 0 on 13 body;
-  package body conv_tb_pkg at 35( 920) + 0 on 14;
-file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "hardware/rtl/layers/conv_layer.vhd" "0d0c4c206a4b197e347f8c89b26df4d641cfb543" "20260717123556.556":
-  entity conv_layer at 1( 0) + 0 on 11;
-  architecture rtl of conv_layer at 21( 424) + 0 on 12;
-file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "verification/tb/conv/tb_conv_layer_initial_line_fill.vhd" "71bc2bdad82502f421ceada003b73755effdf54e" "20260717123556.579":
+file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "verification/tb/conv/tb_conv_layer_weight_filling.vhd" "54c37891e2d269b3fd8c062f6deeb204a5d82d7b" "20260717130545.354":
+  entity tb_conv_layer_weight_filling at 1( 0) + 0 on 19;
+  architecture sim of tb_conv_layer_weight_filling at 13( 184) + 0 on 20;
+file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "verification/tb/conv/tb_conv_layer_initial_line_fill.vhd" "c453ab273e15cf8156e58d7d7a92fe56056a0fdb" "20260717130544.971":
   entity tb_conv_layer_initial_line_fill at 1( 0) + 0 on 15;
   architecture sim of tb_conv_layer_initial_line_fill at 13( 190) + 0 on 16;
+file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "hardware/rtl/layers/conv_layer.vhd" "27eb1af6bca4a02104d4a85f76f465cff0b6647f" "20260717130544.946":
+  entity conv_layer at 1( 0) + 0 on 11;
+  architecture rtl of conv_layer at 26( 575) + 0 on 12;
+file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "verification/tb/conv/conv_tb_pkg.vhd" "8310a2cef5ba7a92bb2b07cfca2df622517db537" "20260717130544.958":
+  package conv_tb_pkg at 1( 0) + 0 on 13 body;
+  package body conv_tb_pkg at 52( 1527) + 0 on 14;
+file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "verification/tb/conv/tb_conv_layer_prime_k_line.vhd" "c847324e9567d6ccee4464b749ddefcf03e7cd95" "20260717130545.162":
+  entity tb_conv_layer_prime_k_line at 1( 0) + 0 on 17;
+  architecture sim of tb_conv_layer_prime_k_line at 13( 180) + 0 on 18;

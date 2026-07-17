@@ -64,5 +64,9 @@ run_testbench \
     "verification/tb/conv/tb_conv_layer_prime_k_line.vhd" \
     "tb_conv_layer_prime_k_line"
 
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_weight_filling.vhd" \
+    "tb_conv_layer_weight_filling"
+
 echo
 echo "All convolution testbenches passed."

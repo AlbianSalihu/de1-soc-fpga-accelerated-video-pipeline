@@ -4,17 +4,22 @@ use ieee.numeric_std.all;
 
 entity conv_layer is
     generic (
-        G_C_IN   : positive;
-        G_W_IN   : positive;
+        G_C_IN : positive;
+        G_W_IN : positive;
+        G_C_PAR : positive;
         G_KERNEL : positive
     );
     port (
-        clk     : in  std_logic;
-        rst_n   : in  std_logic;
+        clk : in std_logic;
+        rst_n : in std_logic;
 
-        i_valid : in  std_logic;
+        i_valid : in std_logic;
         i_ready : out std_logic;
-        i_data  : in  std_logic_vector(7 downto 0)
+        i_data : in std_logic_vector(7 downto 0);
+
+        i_weight_valid : in std_logic; 
+        o_weight_ready : out std_logic;
+        i_weight_data : in std_logic_vector(7 downto 0)
     );
 end entity conv_layer;
 
@@ -24,7 +29,6 @@ architecture rtl of conv_layer is
         S_IDLE,
         S_INITIAL_LINE_FILL,
         S_PRIME_K_LINE,
-        S_WEIGHT_FILLING,
         S_CALC_AND_SLIDING_WINDOW,
         S_STREAM_LINE_FILLING,
         S_LINE_ROTATION
@@ -33,15 +37,25 @@ architecture rtl of conv_layer is
     signal state : conv_states := S_IDLE;
 
     constant C_LINE_SIZE : positive := G_W_IN * G_C_IN;
-
     constant C_INITIAL_FILL_SIZE : positive := (G_KERNEL - 1) * C_LINE_SIZE;
-
     constant C_PRIME_FILL_SIZE : positive := G_KERNEL * G_C_IN;
+    constant C_WEIGHT_FILL_SIZE : positive := G_C_PAR * G_KERNEL * G_KERNEL;
+
+    type t_weight_buffer is array(
+        0 to C_WEIGHT_FILL_SIZE - 1
+    ) of signed(7 downto 0);
 
     type t_line_buffer is array (
         0 to G_KERNEL,
         0 to C_LINE_SIZE - 1
     ) of std_logic_vector(7 downto 0);
+
+    signal weight_buffer : t_weight_buffer;
+
+    signal weight_fill_active : std_logic := '0';
+    signal weight_group_ready : std_logic := '0';
+    signal weight_accepted : std_logic;
+    signal weight_fill_count : natural range 0 to C_WEIGHT_FILL_SIZE - 1 := 0; 
 
     signal line_buffer : t_line_buffer;
 
@@ -84,6 +98,9 @@ begin
 
     line_buffer_wr_addr <= initial_fill_count mod C_LINE_SIZE when initial_fill_active = '1' else prime_fill_count;
 
+    o_weight_ready <= weight_fill_active;
+    weight_accepted <= i_weight_valid and weight_fill_active;
+
     controller_process : process(clk)
     begin
         if rising_edge(clk) then
@@ -102,10 +119,9 @@ begin
                         end if;
 
                     when S_PRIME_K_LINE =>
-                        null;
-
-                    when S_WEIGHT_FILLING =>
-                        null;
+                        if first_window_ready = '1' and weight_group_ready = '1' then 
+                            state <= S_CALC_AND_SLIDING_WINDOW;
+                        end if;
 
                     when S_CALC_AND_SLIDING_WINDOW =>
                         null;
@@ -172,7 +188,7 @@ begin
 
                         if prime_fill_count = C_PRIME_FILL_SIZE - 1 then
                             prime_k_line_active <= '0';
-                            first_window_ready  <= '1';
+                            first_window_ready <= '1';
 
                         else
                             prime_fill_count <= prime_fill_count + 1;
@@ -199,13 +215,28 @@ begin
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
-                null;
-
-            elsif start_weight_fill = '1' then
-                null;
+                weight_fill_active <= '0';
+                weight_group_ready <= '0';
+                weight_fill_count <= 0;
 
             else
-                null;
+                if start_weight_fill = '1' then
+                    weight_fill_active <= '1';
+                    weight_group_ready <= '0';
+                    weight_fill_count <= 0;
+
+                elsif weight_fill_active = '1' then
+                    if weight_accepted = '1' then
+                        weight_buffer(weight_fill_count) <= signed(i_weight_data);
+
+                        if weight_fill_count = C_WEIGHT_FILL_SIZE - 1 then
+                            weight_fill_active <= '0';
+                            weight_group_ready <= '1'; 
+                        else
+                            weight_fill_count <= weight_fill_count + 1;
+                        end if;
+                    end if;
+                end if;
             end if;
         end if;
     end process;

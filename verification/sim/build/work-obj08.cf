@@ -1,0 +1,4 @@
+v 4
+file "/home/feoh/Documents/portfolio/Freelancing/de10-soc-fpga-accelerated-video-pipeline/" "hardware/rtl/layers/conv_layer.vhd" "61d2286b7381c424f0e31fd03f24ac61d81c051a" "20260717100629.836":
+  entity conv_layer at 1( 0) + 0 on 13;
+  architecture rtl of conv_layer at 21( 418) + 0 on 14;

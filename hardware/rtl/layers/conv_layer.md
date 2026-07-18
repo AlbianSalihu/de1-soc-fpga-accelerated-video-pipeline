@@ -1,333 +1,841 @@
 # `conv_layer`
 
-Generic streaming convolution layer for the FPGA inference pipeline.
+Generic streaming quantized convolution layer for the FPGA inference pipeline.
 
-> **Status:** architectural draft.  
-> The controller schedule is defined at a high level, but the external interface,
-> exact cycle timing, and datapath details are still being finalized.
+> **Status: functionally complete and bit-exact in simulation.**
+>
+> The layer has been verified with directed testbenches and against the exported
+> real vectors for all five convolution layers of the current model.
 
 ---
 
 ## Role
 
-`conv_layer` performs one quantized convolution stage:
+`conv_layer` performs one complete quantized convolution stage:
 
 ```text
 uint8 activations
     ↓
 int8 convolution weights
     ↓
-int32 accumulation
+signed int32 accumulation
     ↓
-bias + ReLU + fixed-point requantisation
+signed int32 bias addition
+    ↓
+ReLU
+    ↓
+fixed-point requantization
+    ↓
+uint8 saturation
     ↓
 uint8 output activations
 ```
 
-The same generic layer is intended to support all convolution stages by changing
-its dimensions, kernel size, channel counts, padding, and parallelism parameters.
+The same RTL block supports the model's convolution layers through generics for:
 
-The architecture is designed around continuous streaming:
-
-- incoming activations fill line buffers;
-- convolution starts as soon as the first complete window is available;
-- the next activation line continues filling while the current rows are processed;
-- weights are loaded independently and synchronized with activation readiness;
-- physical line-buffer contents are not copied during rotation—only their roles change.
+```text
+input channels
+output channels
+input width and height
+kernel size
+padding
+stride
+output-channel parallelism
+```
 
 ---
 
-## Current design decisions
+## Supported arithmetic
 
-### Activation buffering
-
-For a `K × K` convolution window, the controller keeps:
-
-- `K` active activation rows used by the convolution;
-- one spare row buffer receiving the next activation line.
-
-For `K = 3`, the physical roles are therefore:
+For each output channel:
 
 ```text
-three active row buffers
-one spare write buffer
+raw_acc =
+    Σ(input_activation × signed_weight)
+
+biased_acc =
+    raw_acc + bias[channel]
+
+relu_acc =
+    max(biased_acc, 0)
+
+product =
+    uint64(relu_acc) × uint32(requant_multiplier[channel])
+
+if requant_shift[channel] > 0:
+    product += 2^(requant_shift[channel] - 1)
+
+shifted =
+    product >> requant_shift[channel]
+
+output =
+    min(shifted, 255)
 ```
 
-After one output row is complete, the oldest active buffer is released and becomes
-the next spare write buffer.
+The final result is an unsigned 8-bit activation.
 
-### Weight handling
+The rounding behavior is round-half-up for nonnegative values.
 
-The convolution datapath receives weights through a common weight-stream abstraction.
+There is currently no output zero-point addition.
 
-The source may be:
+---
 
-- local FPGA BRAM initialized at configuration time; or
-- a FIFO filled from external FPGA SDRAM.
+## Generics
 
-The convolution controller should not depend on which source is selected.
+```vhdl
+G_C_IN    : positive;
+G_C_OUT   : positive;
+G_W_IN    : positive;
+G_H_IN    : positive;
+G_C_PAR   : positive;
+G_KERNEL  : positive;
+G_PADDING : natural;
+G_STRIDE  : positive
+```
 
-The active working set is currently defined as:
+### `G_C_PAR`
+
+`G_C_PAR` is the number of output channels calculated in parallel.
+
+One output group contains:
 
 ```text
-C_PAR × K × K weights
+G_C_PAR output channels
 ```
 
-where `C_PAR` is the number of input-channel contributions processed in parallel.
+The number of output groups is:
 
-### Accumulation
+```text
+G_C_OUT / G_C_PAR
+```
 
-Activations are unsigned 8-bit values, weights are signed 8-bit values, and partial
-sums use signed 32-bit accumulators.
+The current implementation requires:
 
-Bias is used to initialize the accumulator for an output value. Contributions from
-successive input-channel groups are then added until the output is complete.
+```text
+G_C_OUT mod G_C_PAR = 0
+```
 
-The exact accumulator-bank organization is still to be finalized because it depends
-on the final output-channel and weight-group loop order.
+A partially populated final output group is not currently supported.
 
 ---
 
 ## Interface
 
-The external interface is intentionally left undefined for now.
+### Clock and reset
 
-The final entity is expected to include:
+```vhdl
+clk   : in std_logic;
+rst_n : in std_logic;
+```
 
-- clock and reset;
-- ready/valid activation input;
-- ready/valid activation output;
-- ready/valid weight input;
-- frame or tensor boundary information;
-- generics for tensor dimensions, kernel size, padding, stride, and parallelism.
+The reset is synchronous and active low.
 
-Exact signal names, widths, sideband fields, and tensor ordering will be defined only
-after the controller schedule and datapath are validated in simulation.
+---
+
+### Activation input stream
+
+```vhdl
+i_valid : in  std_logic;
+i_ready : out std_logic;
+i_data  : in  std_logic_vector(7 downto 0);
+```
+
+Activations are unsigned 8-bit values.
+
+A transfer occurs when:
+
+```text
+i_valid = 1 and i_ready = 1
+```
+
+Input activations are streamed in:
+
+```text
+input row
+    → input column
+        → input channel
+```
+
+order.
+
+---
+
+### Weight input stream
+
+```vhdl
+i_weight_valid : in  std_logic;
+o_weight_ready : out std_logic;
+i_weight_data  : in  std_logic_vector(7 downto 0);
+```
+
+Weights are signed 8-bit values.
+
+A transfer occurs when:
+
+```text
+i_weight_valid = 1 and o_weight_ready = 1
+```
+
+The active weight buffer contains:
+
+```text
+G_C_PAR × G_KERNEL × G_KERNEL
+```
+
+weights.
+
+This represents one kernel slice for:
+
+```text
+one output-channel group
+one input channel
+```
+
+when `G_C_IN > 1`.
+
+The external weight source must provide each requested slice in lane-major order:
+
+```text
+lane 0 kernel values
+lane 1 kernel values
+...
+lane G_C_PAR - 1 kernel values
+```
+
+Within each lane, kernel values are supplied in row-major order.
+
+---
+
+### Parameter configuration interface
+
+```vhdl
+cfg_we    : in std_logic;
+cfg_sel   : in std_logic_vector(1 downto 0);
+cfg_addr  : in std_logic_vector(19 downto 0);
+cfg_wdata : in std_logic_vector(31 downto 0);
+```
+
+Parameters are indexed by absolute output-channel number.
+
+```text
+cfg_sel = "01"  signed int32 bias
+cfg_sel = "10"  unsigned uint32 requantization multiplier
+cfg_sel = "11"  unsigned uint8 requantization right shift
+cfg_sel = "00"  reserved
+```
+
+For bias and multiplier values, all 32 bits of `cfg_wdata` are used.
+
+For right-shift values, only:
+
+```vhdl
+cfg_wdata(7 downto 0)
+```
+
+is used.
+
+Parameters must be loaded before processing a frame.
+
+They remain stored across frame restarts.
+
+---
+
+### Quantized output stream
+
+```vhdl
+o_valid : out std_logic;
+o_data  : out std_logic_vector(G_C_PAR * 8 - 1 downto 0);
+```
+
+Each accepted output transfer contains `G_C_PAR` final uint8 output channels.
+
+Lane `n` is packed into:
+
+```vhdl
+o_data((n + 1) * 8 - 1 downto n * 8)
+```
+
+The output transfer ordering is:
+
+```text
+output row
+    → output group
+        → output column
+            → lane
+```
+
+The absolute output channel represented by one lane is:
+
+```text
+output_group × G_C_PAR + lane
+```
+
+---
+
+### Raw accumulator debug output
+
+```vhdl
+i_acc_ready : in  std_logic;
+o_acc_valid : out std_logic;
+o_acc_data  : out std_logic_vector(G_C_PAR * 32 - 1 downto 0);
+```
+
+The raw output contains the signed int32 convolution accumulators before:
+
+```text
+bias
+ReLU
+requantization
+```
+
+Lane `n` is packed into:
+
+```vhdl
+o_acc_data((n + 1) * 32 - 1 downto n * 32)
+```
+
+The quantized and raw outputs describe the same output transfer:
+
+```text
+o_valid = o_acc_valid
+```
+
+The current implementation uses `i_acc_ready` as the ready input for both output
+interfaces.
+
+While:
+
+```text
+o_valid = 1
+and
+i_acc_ready = 0
+```
+
+both `o_data` and `o_acc_data` remain stable.
+
+The raw interface is currently retained for debugging and verification.
+
+---
+
+### Frame completion
+
+```vhdl
+o_done : out std_logic;
+```
+
+`o_done` pulses for one clock when:
+
+```text
+the final output has been accepted
+and
+all required trailing input draining has completed
+and
+the layer is returning to its initial state
+```
+
+After `o_done`, the layer automatically becomes ready to process another frame.
+
+A global reset is not required between frames.
+
+---
+
+## Output dimensions
+
+The padded input dimensions are:
+
+```text
+padded_width  = G_W_IN + 2 × G_PADDING
+padded_height = G_H_IN + 2 × G_PADDING
+```
+
+The output dimensions are:
+
+```text
+output_width =
+    ((padded_width - G_KERNEL) / G_STRIDE) + 1
+
+output_height =
+    ((padded_height - G_KERNEL) / G_STRIDE) + 1
+```
+
+Padding is implemented as virtual zero-valued activation locations.
+
+Padded positions are not read from the activation stream.
+
+---
+
+## Activation buffering
+
+The layer uses:
+
+```text
+G_KERNEL active physical row buffers
+one spare physical row buffer
+```
+
+The physical line buffer therefore contains:
+
+```text
+G_KERNEL + 1 rows
+```
+
+Each row contains:
+
+```text
+G_W_IN × G_C_IN bytes
+```
+
+A logical-to-physical row map selects the physical buffers used by the current
+convolution window.
+
+After advancing vertically, the logical row roles rotate:
+
+```text
+before:
+    active rows = A, B, C
+    spare row   = D
+
+after:
+    active rows = B, C, D
+    spare row   = A
+```
+
+No activation data is copied during rotation.
+
+Only the row mapping and validity flags are changed.
+
+Virtual top and bottom padding rows are represented through row-valid flags and
+produce zero-valued activations.
+
+---
+
+## Horizontal window traversal
+
+For output column `x` and kernel column `kx`, the real input column is:
+
+```text
+input_column =
+    x × G_STRIDE + kx - G_PADDING
+```
+
+When this column is outside:
+
+```text
+0 to G_W_IN - 1
+```
+
+the activation value is zero.
+
+The controller waits until the required real activation columns have arrived before
+starting each output window.
+
+---
+
+## Vertical stride handling
+
+Vertical stride is implemented by performing repeated logical row rotations between
+output rows.
+
+`vertical_advance_remaining` tracks how many row advances are still required before
+the next output row can be calculated.
+
+Rows that must be consumed from the input stream but are not used by another output
+window are drained before the frame completes.
+
+---
+
+## Weight handling
+
+Weight loading runs concurrently with activation preparation.
+
+The first activation window can only begin calculation when both are true:
+
+```text
+first_window_ready = 1
+weight_group_ready = 1
+```
+
+The active weight buffer contains one `G_C_PAR × K × K` slice.
+
+For `G_C_IN > 1`, the layer requests a new weight slice for each input-channel
+contribution.
+
+Accumulation continues across all input channels before producing one output result.
+
+For multiple output groups, the layer reloads the corresponding output-channel
+weights and repeats the horizontal sweep over the same logical activation rows.
+
+---
+
+## Accumulation and requantization
+
+Activations are converted from unsigned 8-bit to a positive signed value.
+
+Weights are signed 8-bit values.
+
+Each multiplication produces a signed product, which is resized and accumulated into
+a signed 32-bit accumulator.
+
+For each output group, all `G_C_PAR` lanes are calculated in parallel.
+
+For `G_C_IN > 1`, accumulators are preserved while successive input-channel weight
+slices are processed.
+
+After the final kernel value of the final input channel:
+
+```text
+raw accumulator is stored
+bias is added
+ReLU is applied
+requantization is performed
+raw and quantized outputs become valid
+```
+
+The quantized result is calculated using:
+
+```text
+biased_acc = raw_acc + bias
+
+relu_acc = max(biased_acc, 0)
+
+product = relu_acc × requant_multiplier
+
+if requant_shift > 0:
+    product += 2^(requant_shift - 1)
+
+shifted = product >> requant_shift
+
+output = min(shifted, 255)
+```
 
 ---
 
 ## Controller state machine
 
-The current controller is represented as a concurrent statechart. Several states may
-remain active as independent operations progress, allowing activation filling, weight
-movement, and convolution work to overlap.
+The main controller uses the following states:
 
-<p align="center">
-  <a href="State_Machine_conv.svg">
-    <img
-      src="State_Machine_conv.svg"
-      alt="Generic convolution-layer controller state machine"
-      width="100%"
-    >
-  </a>
-</p>
+```vhdl
+type conv_states is (
+    S_IDLE,
+    S_INITIAL_LINE_FILL,
+    S_PRIME_K_LINE,
+    S_CALC_AND_SLIDING_WINDOW,
+    S_STREAM_LINE_FILLING,
+    S_LINE_ROTATION
+);
+```
 
-<p align="center">
-  <em>Click the diagram to open the full-size SVG.</em>
-</p>
+Several datapath operations are implemented as concurrent worker processes rather
+than as additional controller states.
 
----
-
-## State-machine behavior
-
-### `IDLE`
-
-Waits for the start of a new activation tensor.
-
-The transition out of `IDLE` starts two independent preparation paths:
+These include:
 
 ```text
-initial activation-line filling
-            ||
-initial weight filling
+weight filling
+initial line filling
+prime-line filling
+stream-line filling
+MAC calculation
+parameter loading
+line-buffer writing
+line rotation
 ```
 
 ---
 
-### `INITIAL LINE FILL`
+### `S_IDLE`
 
-Fills the first `K - 1` complete activation lines.
+Initializes a new frame.
+
+Entering `S_IDLE` starts:
 
 ```text
-remain in state while:
-    nb_full_line < K - 1
-
-leave state when:
-    nb_full_line = K - 1
+initial activation filling
+and
+first weight-group loading
 ```
 
-No convolution can begin yet because the `K`th row is not sufficiently available.
+The line-buffer mapping and frame traversal counters are restored for the new frame.
 
 ---
 
-### `PRIME Kth LINE`
+### `S_INITIAL_LINE_FILL`
 
-Fills the first `K` columns of the `K`th activation line.
+Loads the initial real activation rows required before the bottom row of the first
+logical kernel window can be primed.
+
+The number of initial rows is:
 
 ```text
-remain in state while:
-    nb_column < K
-
-first window ready when:
-    nb_column >= K
+G_KERNEL - G_PADDING - 1
 ```
 
-At this point, the first `K × K` activation window exists, even though the `K`th line
-has not yet been filled completely.
+This accounts for virtual top padding rows.
 
 ---
 
-### `WEIGHT FILLING`
+### `S_PRIME_K_LINE`
 
-Loads one active weight group:
+Loads the first `G_KERNEL` columns of the bottom logical row when that row maps to a
+real input row.
+
+When the logical row is a virtual padding row, no activation bytes are consumed and
+the first window is marked ready immediately.
+
+Calculation begins when:
 
 ```text
-C_PAR × K × K weights
+first_window_ready = 1
+and
+weight_group_ready = 1
 ```
 
-The state remains active until the complete group is available, then asserts:
-
-```text
-weights_ready
-```
-
-Weight filling begins independently from activation-line filling.
+unless additional vertical advancement or trailing input draining is required.
 
 ---
 
-### Calculation join
+### `S_CALC_AND_SLIDING_WINDOW`
 
-The horizontal convolution sweep begins only when both sides are ready:
+Calculates all output columns for the current output group.
 
-```text
-first_window_ready
-AND
-weights_ready
-```
-
-Using a latched `first_window_ready` condition is safer than testing only
-`nb_column = K`, because activation filling may advance beyond column `K` while
-waiting for weights.
-
----
-
-### `CALCULATION AND SLIDING WINDOW`
-
-Uses the active `K × K × C_PAR` activation window and matching weights.
-
-During the horizontal pass:
+For each output window, the calculation traverses:
 
 ```text
-calculate current window
-    ↓
-advance the activation window by one column
-    ↓
-repeat until the horizontal sweep is complete
+kernel position
+    → input channel
 ```
 
-The active weight group remains fixed during one horizontal sweep. The activation
-window moves across the row.
+contributions.
 
-At the end of the sweep:
-
-- if more weight groups are required, return to `WEIGHT FILLING` and sweep the same
-  active rows again;
-- if the final required weight group is complete, wait for the next activation line
-  to be ready before rotating the line-buffer roles.
-
----
-
-### `STREAM LINE FILLING`
-
-Runs concurrently with the horizontal convolution sweep.
-
-It first completes the partially filled `K`th line, then continues writing the next
-activation line into the spare row buffer.
+The horizontal output ordering is:
 
 ```text
-finish current line
-    ↓
-select spare row buffer
-    ↓
-fill next line
+group 0: all output columns
+group 1: all output columns
+...
+final group: all output columns
 ```
 
-The stream-filling path stops when the spare row buffer contains one complete line.
+After the final output group is complete, vertical traversal begins.
 
 ---
 
-### `LINE ROTATION`
+### `S_STREAM_LINE_FILLING`
 
-Entered when both conditions are satisfied:
+Completes the remaining part of the next physical activation row.
+
+This process may overlap with calculation because stream filling is controlled by an
+independent worker process.
+
+For virtual bottom-padding rows, no activation bytes are consumed.
+
+---
+
+### `S_LINE_ROTATION`
+
+Rotates the logical row mapping without copying physical activation data.
+
+The state determines whether:
 
 ```text
-all required horizontal sweeps for the current row are complete
-AND
-the next activation line is completely filled
+another vertical advance is required
+another output row is available
+trailing real input rows must be drained
+or
+the frame is complete
 ```
 
-The state changes buffer roles only; it does not copy activation data.
-
-For `K = 3`:
+When no further rows remain:
 
 ```text
-before rotation:
-    active rows = A, B, C
-    spare row   = D
-
-after rotation:
-    active rows = B, C, D
-    spare row   = A
+o_done pulses
+the controller returns to S_IDLE
+the layer prepares for another frame
 ```
 
-The horizontal position is reset, and the released oldest row becomes the next write
-buffer.
+---
+
+## Current implementation constraints
+
+The current implementation assumes:
+
+```text
+G_C_OUT mod G_C_PAR = 0
+G_PADDING <= G_KERNEL - 2
+G_W_IN > G_KERNEL
+padded width >= kernel size
+padded height >= kernel size
+square kernels
+the same stride in both spatial dimensions
+uint8 activations
+int8 weights
+signed int32 accumulators
+```
+
+A partially populated final output group is not supported.
+
+Parameter memories must be loaded before a frame begins.
+
+The external weight source must respond to every asserted `o_weight_ready` request
+with the correct output-group and input-channel weight slice.
 
 ---
 
-### End of tensor
+## Verification status
 
-After the final output row and final weight group are complete, the controller drains
-any remaining output data and returns to `IDLE`.
+The implementation has been verified incrementally with directed VHDL testbenches.
 
-The exact final-state and output-handshake behavior will be defined with the external
-interface.
+Covered behavior includes:
+
+```text
+initial line filling
+prime-line filling
+weight filling
+concurrent activation and weight preparation
+first-window calculation
+horizontal sliding
+line-buffer rotation
+multiple output groups
+multiple input channels
+padding
+stride 2 and stride 3
+trailing input-row draining
+activation source gaps
+weight source gaps
+output backpressure
+raw output stability
+quantized output stability
+bias addition
+ReLU
+requantization
+rounding
+uint8 saturation
+per-channel parameter selection
+frame completion
+automatic restart
+```
+
+A traversal-matrix test verifies combinations of:
+
+```text
+padding
+stride
+output groups
+multiple input channels
+source gaps
+backpressure
+trailing-row draining
+```
+
+The real-vector testbench loads the exported:
+
+```text
+<prefix>_in.bin
+<prefix>_weights.bin
+<prefix>_biases.bin
+<prefix>_requant_m.bin
+<prefix>_requant_r.bin
+<prefix>_out.bin
+```
+
+files.
+
+It compares:
+
+```text
+o_acc_data
+    against generated raw signed-int32 convolution references
+
+o_data
+    against the exported final uint8 model outputs
+```
+
+All five real convolution layers currently pass bit-exact comparison:
+
+```text
+Ran:    5 layers
+Passed: 5 layers
+Failed: 0 layers
+```
 
 ---
 
-## Open design points
+## Simulation commands
 
-The following items are intentionally not fixed yet:
+Run the directed convolution regressions:
 
-- exact VHDL entity and port list;
-- activation tensor ordering and transfer width;
-- exact definition of `C_PAR`;
-- output-channel parallelism;
-- accumulator-bank size and addressing;
-- padding and stride scheduling;
-- local-BRAM versus external-FIFO weight adapters;
-- output serialization and backpressure behavior;
-- end-of-frame and pipeline-drain handling.
+```bash
+bash verification/sim/run_conv.sh
+```
 
-These decisions will be made incrementally while building `conv.vhd` and its
-testbenches.
+Run the padding, stride, grouping, and traversal matrix:
+
+```bash
+bash verification/sim/run_conv_traversal.sh
+```
+
+Run the real model vectors:
+
+```bash
+bash verification/sim/run_layers.sh
+```
+
+Regenerate the raw accumulator references:
+
+```bash
+FORCE_GOLDEN=1 \
+bash verification/sim/run_layers.sh
+```
+
+Run one selected model layer:
+
+```bash
+bash verification/sim/run_layers.sh features_0
+```
 
 ---
 
-## Verification plan
+## State-machine diagram
 
-Implementation should proceed in small, independently verified steps:
+The state-machine diagram should show the six main controller states:
 
-1. verify filling of the first `K - 1` complete lines;
-2. verify priming of the first `K` columns of the `K`th line;
-3. verify one `C_PAR × K × K` weight-group load;
-4. verify the activation-ready and weight-ready join;
-5. verify one horizontal window sweep;
-6. verify simultaneous line filling and calculation;
-7. verify line-buffer role rotation;
-8. verify repeated weight-group sweeps and accumulation;
-9. verify a complete small convolution against a software reference;
-10. add padding, requantisation, output streaming, and backpressure.
+```text
+S_IDLE
+S_INITIAL_LINE_FILL
+S_PRIME_K_LINE
+S_CALC_AND_SLIDING_WINDOW
+S_STREAM_LINE_FILLING
+S_LINE_ROTATION
+```
 
-The first testbenches should use very small tensors so every line-buffer write,
-weight load, window position, and accumulator value can be inspected directly.
+Weight filling, MAC calculation, parameter loading, and line-buffer writing are
+concurrent worker processes rather than separate main FSM states.
+
+The diagram should also show:
+
+```text
+padding-aware initial filling
+stride-driven repeated row rotation
+trailing input draining
+o_done
+automatic return to S_IDLE
+```
+
+---
+
+## Remaining implementation work
+
+The functional RTL milestone is complete.
+
+Remaining FPGA implementation work includes:
+
+```text
+Quartus synthesis
+DSP inference inspection
+embedded-memory inference inspection
+resource-utilization analysis
+timing analysis and Fmax
+production interface cleanup
+possible removal of raw debug outputs
+support for partially populated final output groups
+```

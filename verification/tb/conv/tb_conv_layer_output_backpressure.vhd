@@ -70,9 +70,11 @@ architecture sim of tb_conv_layer_output_backpressure is
 
     signal i_acc_ready : std_logic := '0';
     signal o_acc_valid : std_logic;
+    signal o_done : std_logic;
     signal o_acc_data  :
         std_logic_vector(C_C_PAR * 32 - 1 downto 0);
-
+    signal done_seen : std_logic := '0';
+    signal done_count : natural range 0 to 2 := 0;  
     signal activation_accept_count : natural := 0;
     signal weight_accept_count     : natural := 0;
     signal output_accept_count     : natural := 0;
@@ -90,6 +92,7 @@ begin
             G_H_IN    => C_H_IN,
             G_C_PAR   => C_C_PAR,
             G_KERNEL  => C_KERNEL,
+            
             G_PADDING => 0,
             G_STRIDE  => 1
         )
@@ -107,6 +110,14 @@ begin
 
             i_acc_ready    => i_acc_ready,
             o_acc_valid    => o_acc_valid,
+            cfg_we    => '0',
+            cfg_sel   => (others => '0'),
+            cfg_addr  => (others => '0'),
+            cfg_wdata => (others => '0'),
+
+            o_valid => open,
+            o_data  => open,
+            o_done => o_done,
             o_acc_data     => o_acc_data
         );
 
@@ -172,6 +183,22 @@ begin
         wait;
     end process;
 
+    done_monitor_process : process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                done_seen  <= '0';
+                done_count <= 0;
+
+            elsif o_done = '1' then
+                done_seen <= '1';
+
+                if done_count < 2 then
+                    done_count <= done_count + 1;
+                end if;
+            end if;
+        end if;
+    end process;
 
     transfer_monitor_process : process(clk)
     begin
@@ -312,16 +339,39 @@ begin
                 "the final result."
             severity failure;
 
-        assert i_ready = '0'
+        assert i_ready = '1'
             report
-                "FAIL: activation input remained ready after image " &
-                "completion."
+                "FAIL: activation input did not become ready for the next frame."
+            severity failure;
+        
+        if done_seen = '0' then
+            wait until done_seen = '1';
+        end if;
+
+        wait for 1 ns;
+
+        assert done_count = 1
+            report
+                "FAIL: expected exactly one o_done pulse."
             severity failure;
 
-        assert o_weight_ready = '0'
+        assert o_done = '0'
             report
-                "FAIL: weight input remained ready after weight " &
-                "loading completed."
+                "FAIL: o_done remained asserted for more than one clock."
+            severity failure;
+
+        assert i_ready = '1'
+            report
+                "FAIL: activation input did not become ready for the next frame."
+            severity failure;
+
+        assert o_weight_ready = '1'
+            report
+                "FAIL: weight input did not become ready for the next frame."
+            severity failure;
+        assert o_weight_ready = '1'
+            report
+                "FAIL: weight input did not become ready for the next frame."
             severity failure;
 
         report

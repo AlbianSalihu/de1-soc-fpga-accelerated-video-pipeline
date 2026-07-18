@@ -106,6 +106,7 @@ begin
             G_H_IN    => C_H_IN,
             G_C_PAR   => C_C_PAR,
             G_KERNEL  => C_KERNEL,
+            
             G_PADDING => C_PADDING,
             G_STRIDE  => C_STRIDE
         )
@@ -123,6 +124,14 @@ begin
 
             i_acc_ready => i_acc_ready,
             o_acc_valid => o_acc_valid,
+            cfg_we    => '0',
+            cfg_sel   => (others => '0'),
+            cfg_addr  => (others => '0'),
+            cfg_wdata => (others => '0'),
+
+            o_valid => open,
+            o_data  => open,
+            o_done => open,
             o_acc_data => o_acc_data
         );
 

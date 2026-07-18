@@ -25,6 +25,15 @@ entity conv_layer is
         o_weight_ready : out std_logic;
         i_weight_data : in std_logic_vector(7 downto 0);
 
+        cfg_we : in std_logic;
+        cfg_sel : in std_logic_vector(1 downto 0);
+        cfg_addr : in std_logic_vector(19 downto 0);
+        cfg_wdata : in std_logic_vector(31 downto 0);
+
+        o_valid : out std_logic;
+        o_data : out std_logic_vector(G_C_PAR * 8 - 1 downto 0);
+        o_done : out std_logic;
+
         i_acc_ready : in std_logic;
         o_acc_valid : out std_logic;
         o_acc_data : out std_logic_vector(G_C_PAR * 32 - 1 downto 0)    
@@ -70,6 +79,22 @@ architecture rtl of conv_layer is
     type t_accumulator_array is array (
         0 to G_C_PAR - 1
     ) of signed(31 downto 0);
+
+    type t_bias_store is array(
+        0 to G_C_OUT - 1
+    ) of signed(31 downto 0);
+
+    type t_rq_m_store is array(
+        0 to G_C_OUT - 1  
+    ) of unsigned(31 downto 0);
+
+    type t_rq_r_store is array(
+        0 to G_C_OUT - 1
+    ) of unsigned(7 downto 0);
+
+    type t_quantized_array is array(
+        0 to G_C_PAR - 1
+    ) of std_logic_vector(7 downto 0);
 
     type t_row_map is array (
         0 to G_KERNEL - 1
@@ -133,21 +158,26 @@ architecture rtl of conv_layer is
     signal line_rotation_has_next : std_logic := '0';
     signal result_buffer : t_accumulator_array;
     signal result_pending : std_logic := '0';
+    signal bias_store : t_bias_store := (others => (others => '0'));
+    signal rq_m_store : t_rq_m_store := (others => to_unsigned(1,32));
+    signal rq_r_store : t_rq_r_store := (others => (others => '0'));
+    signal quantized_result_buffer : t_quantized_array;
 
     signal row_valid : t_row_valid := (others => '0');
     signal output_group_count : natural range 0 to C_OUTPUT_GROUPS - 1 := 0;
     signal logical_top_row : integer range -integer(G_PADDING) to G_H_IN + integer(G_PADDING) := -integer(G_PADDING);
     signal vertical_advance_remaining : natural range 0 to G_STRIDE - 1 := 0;
+    signal drain_input_active : std_logic := '0';
 
 begin
     start_line_fill   <= '1' when state = S_IDLE else '0';
-    start_weight_fill <= '1' when state = S_IDLE or weight_refill_request = '1' or (line_rotation_done = '1' and line_rotation_has_next = '1' and vertical_advance_remaining = 0 and (G_C_IN > 1 or C_OUTPUT_GROUPS > 1)) else '0';
+    start_weight_fill <= '1' when state = S_IDLE or weight_refill_request = '1' or (line_rotation_done = '1' and line_rotation_has_next = '1' and drain_input_active = '0' and vertical_advance_remaining = 0 and (G_C_IN > 1 or C_OUTPUT_GROUPS > 1)) else '0';
 
     start_prime_k_line <= initial_line_fill_done or (line_rotation_done and line_rotation_has_next);
 
     start_line_rotation <= '1' when state = S_STREAM_LINE_FILLING and stream_line_fill_done = '1' else '0';
 
-    start_stream_line_fill <= '1' when state = S_PRIME_K_LINE and first_window_ready = '1' and (vertical_advance_remaining > 0 or weight_group_ready = '1') else '0';
+    start_stream_line_fill <= '1' when state = S_PRIME_K_LINE and first_window_ready = '1' and (drain_input_active = '1' or vertical_advance_remaining > 0 or weight_group_ready = '1') else '0';
 
     i_ready <= initial_fill_active or prime_k_line_active or stream_line_fill_active;
 
@@ -162,10 +192,16 @@ begin
     o_weight_ready <= weight_fill_active;
     weight_accepted <= i_weight_valid and weight_fill_active;
     o_acc_valid <= result_pending;
+    o_valid <= result_pending;
 
     accumulator_output_generate : 
     for lane in 0 to G_C_PAR - 1 generate
         o_acc_data((lane + 1) * 32 - 1 downto lane * 32) <= std_logic_vector(result_buffer(lane));
+    end generate;
+
+    quantized_output_generate :
+    for lane in 0 to G_C_PAR - 1 generate
+        o_data((lane + 1) * 8 - 1 downto lane * 8) <= quantized_result_buffer(lane);
     end generate;
 
     controller_process : process(clk)
@@ -173,8 +209,10 @@ begin
         if rising_edge(clk) then
             if rst_n = '0' then
                 state <= S_IDLE;
+                o_done <= '0';
 
             else
+                o_done <= '0';
                 case state is
 
                     when S_IDLE =>
@@ -187,7 +225,7 @@ begin
 
                     when S_PRIME_K_LINE =>
                         if first_window_ready = '1' then
-                            if vertical_advance_remaining > 0 then
+                            if drain_input_active = '1' or vertical_advance_remaining > 0 then
                                 state <= S_STREAM_LINE_FILLING;
                             elsif weight_group_ready = '1' then
                                 state <= S_CALC_AND_SLIDING_WINDOW;
@@ -208,6 +246,9 @@ begin
                         if line_rotation_done = '1' then
                             if line_rotation_has_next = '1' then 
                                 state <= S_PRIME_K_LINE;
+                            else
+                                state <= S_IDLE;
+                                o_done <= '1';
                             end if;
                         end if;
                 end case;
@@ -324,6 +365,28 @@ begin
         end if;
     end process;
 
+    parameter_loading_process : process(clk)
+        variable v_addr : natural;
+    begin
+        if rising_edge(clk) then
+            if cfg_we = '1' then
+                v_addr := to_integer(unsigned(cfg_addr));
+                if v_addr < G_C_OUT then
+                    case cfg_sel is
+                        when "01" =>
+                            bias_store(v_addr) <= signed(cfg_wdata);
+                        when "10" =>
+                            rq_m_store(v_addr) <= unsigned(cfg_wdata);
+                        when "11" =>
+                            rq_r_store(v_addr) <= unsigned(cfg_wdata(7 downto 0));
+                        when others =>
+                            null;
+                    end case;
+                end if;
+            end if;
+        end if; 
+    end process;
+
     calculation_process : process(clk)
         variable v_row : natural;
         variable v_col : natural;
@@ -332,9 +395,18 @@ begin
         
         variable v_activation : signed(8 downto 0);
         variable v_product : signed(16 downto 0);
+        variable v_output_channel : natural range 0 to G_C_OUT - 1;
+        variable v_raw_acc : signed(31 downto 0);
+        variable v_biased_acc : signed(31 downto 0);
+        variable v_acc_pos : signed(31 downto 0);
+        variable v_requant_product : unsigned(63 downto 0);
+        variable v_requant_shifted : unsigned(63 downto 0);
+        variable v_requant_shift : natural range 0 to 255;
+
         variable v_input_col : integer;
         variable v_required_extra_columns : integer;
         variable v_required_stream_bytes : natural;
+                        
     begin
         if rising_edge(clk) then
             if rst_n = '0' then 
@@ -352,6 +424,7 @@ begin
                 for lane in 0 to G_C_PAR - 1 loop 
                     accumulators(lane) <= (others => '0');
                     result_buffer(lane) <= (others => '0');
+                    quantized_result_buffer(lane) <= (others => '0');
                 end loop;
             else
                 weight_refill_request <= '0';
@@ -449,7 +522,33 @@ begin
                             v_product := v_activation * weight_buffer(v_weight_addr);
                             accumulators(lane)<=accumulators(lane) + resize(v_product, 32);
                             if calculation_kernel_count = C_KERNEL_SIZE - 1 and calculation_channel_count = G_C_IN - 1 then
-                                result_buffer(lane) <= accumulators(lane) + resize(v_product, 32);
+                                v_raw_acc := accumulators(lane) + resize(v_product, 32);
+                                result_buffer(lane) <= v_raw_acc;
+
+                                v_output_channel := output_group_count * G_C_PAR + lane;
+                                v_biased_acc := v_raw_acc + bias_store(v_output_channel);
+
+                                if v_biased_acc(31) = '1' then
+                                    v_acc_pos := (others => '0');
+                                else
+                                    v_acc_pos := v_biased_acc;
+                                end if;
+
+                                v_requant_product := unsigned(std_logic_vector(v_acc_pos))*rq_m_store(v_output_channel);
+
+                                v_requant_shift := to_integer(rq_r_store(v_output_channel));
+
+                                if v_requant_shift > 0 then
+                                    v_requant_product := v_requant_product + shift_left(to_unsigned(1,64), v_requant_shift - 1);
+                                end if;
+
+                                v_requant_shifted := shift_right(v_requant_product, v_requant_shift);
+                                
+                                if v_requant_shifted > to_unsigned(255, 64) then
+                                    quantized_result_buffer(lane) <= (others => '1');
+                                else
+                                    quantized_result_buffer(lane) <= std_logic_vector(v_requant_shifted(7 downto 0));
+                                end if;
                             end if;
                         end loop;
 
@@ -511,6 +610,8 @@ begin
 
     line_rotation_process : process(clk)
         variable v_new_input_row : integer;
+        variable v_do_rotation : boolean;
+        variable v_drain_rotation : boolean;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
@@ -520,7 +621,27 @@ begin
                 logical_top_row <= -integer(G_PADDING);
 
                 vertical_advance_remaining <= 0;
+                drain_input_active <= '0';
+                line_rotation_done <= '0';
+                line_rotation_has_next <= '0';
 
+                for row in 0 to G_KERNEL - 1 loop
+                    row_map(row) <= row;
+
+                    if integer(row) - integer(G_PADDING) >= 0 and integer(row) - integer(G_PADDING) < G_H_IN then
+                        row_valid(row) <= '1';
+                    else
+                        row_valid(row) <= '0';
+                    end if;
+                end loop;
+            elsif state = S_IDLE then
+                spare_row <= G_KERNEL;
+                output_row_count <= 0;
+
+                logical_top_row <= -integer(G_PADDING);
+
+                vertical_advance_remaining <= 0;
+                drain_input_active <= '0';
                 line_rotation_done <= '0';
                 line_rotation_has_next <= '0';
 
@@ -537,8 +658,30 @@ begin
             else
                 line_rotation_done <= '0';
                 if start_line_rotation = '1' then
-                    if output_row_count < C_OUTPUT_HEIGHT - 1 then
-                        v_new_input_row := logical_top_row + G_KERNEL;
+                    v_new_input_row := logical_top_row + G_KERNEL;
+                    v_do_rotation := false;
+                    v_drain_rotation := false;
+                    if drain_input_active = '1' then
+                        if v_new_input_row >= 0 and v_new_input_row < G_H_IN then
+                            v_do_rotation := true;
+                            v_drain_rotation := true;
+                        else
+                            drain_input_active <= '0';
+                            line_rotation_has_next <= '0';
+                        end if;
+
+                    elsif output_row_count < C_OUTPUT_HEIGHT - 1 then
+                        v_do_rotation := true;
+
+                    elsif v_new_input_row >= 0 and v_new_input_row < G_H_IN then
+                        drain_input_active <= '1';
+                        v_do_rotation := true;
+                        v_drain_rotation := true;
+                    else
+                        line_rotation_has_next <= '0';
+                    end if;
+
+                    if v_do_rotation then
                         for row in 0 to G_KERNEL - 2 loop
                             row_map(row) <= row_map(row + 1);
                             row_valid(row) <= row_valid(row + 1);
@@ -554,8 +697,12 @@ begin
                         end if;
 
                         logical_top_row <= logical_top_row + 1;
+                        line_rotation_has_next <= '1';
 
-                        if vertical_advance_remaining = 0 then
+                        if v_drain_rotation then
+                            vertical_advance_remaining <= 0;
+
+                        elsif vertical_advance_remaining = 0 then
                             if G_STRIDE = 1 then
                                 output_row_count <= output_row_count + 1;
                                 vertical_advance_remaining <= 0;
@@ -569,10 +716,6 @@ begin
                         else
                             vertical_advance_remaining <= vertical_advance_remaining - 1;
                         end if;
-
-                        line_rotation_has_next <= '1';
-                    else
-                        line_rotation_has_next <= '0';
                     end if;
 
                     line_rotation_done <= '1';

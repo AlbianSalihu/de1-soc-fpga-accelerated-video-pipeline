@@ -92,5 +92,9 @@ run_testbench \
     "verification/tb/conv/tb_conv_layer_output_groups.vhd" \
     "tb_conv_layer_output_groups"
 
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_requantization.vhd"\
+    "tb_conv_layer_requantization"
+
 echo
 echo "All convolution testbenches passed."

@@ -80,6 +80,14 @@ begin
 
             o_acc_valid    => o_acc_valid,
             o_acc_data     => o_acc_data,
+            cfg_we    => '0',
+            cfg_sel   => (others => '0'),
+            cfg_addr  => (others => '0'),
+            cfg_wdata => (others => '0'),
+
+            o_valid => open,
+            o_done => open,
+            o_data  => open,
             i_acc_ready => '1'
         );
 

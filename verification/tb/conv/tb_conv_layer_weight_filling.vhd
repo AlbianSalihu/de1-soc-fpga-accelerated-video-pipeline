@@ -48,6 +48,7 @@ begin
             G_H_IN    => C_H_IN,
             G_C_PAR   => C_C_PAR,
             G_KERNEL  => C_KERNEL,
+            
             G_PADDING => 0,
             G_STRIDE  => 1
         )
@@ -64,6 +65,14 @@ begin
             i_weight_data  => i_weight_data,
             o_acc_valid => open,
             o_acc_data  => open,
+            cfg_we    => '0',
+            cfg_sel   => (others => '0'),
+            cfg_addr  => (others => '0'),
+            cfg_wdata => (others => '0'),
+
+            o_valid => open,
+            o_data  => open,
+            o_done => open,
             i_acc_ready => '1'
         );
 

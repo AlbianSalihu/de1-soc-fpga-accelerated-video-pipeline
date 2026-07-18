@@ -1,576 +1,1448 @@
 # Hardware — FPGA Inference Pipeline
 
-This directory contains the RTL implementation of a fully integer-only CNN inference pipeline
-targeting the **Intel Cyclone V SE SoC** on the Terasic DE1-SoC board.
+This directory contains the RTL implementation of an integer-only CNN inference
+pipeline targeting the **Intel Cyclone V SE SoC** on the Terasic DE1-SoC board.
 
-The pipeline runs **AlexNet64Gray** — a compact convolutional network trained and quantized
-in the `ml/` directory — as a spatial streaming datapath entirely on the FPGA fabric.
-All arithmetic is integer-only: int8 weights, uint8 activations, int32 accumulators,
-with fixed-point requantisation between layers. No floating-point hardware is required.
+The pipeline targets **AlexNet64Gray**, a compact convolutional network trained and
+quantized in the `ml/` directory.
 
----
+All inference arithmetic is integer-only:
 
-## Pre-Implementation Analysis
+```text
+uint8 activations
+int8 weights
+int32 accumulators
+per-channel fixed-point requantization
+```
 
-Before writing a single line of VHDL, a full pre-implementation analysis was carried out
-to verify that the design fits the hardware and to make every major architectural decision
-on firm numerical ground rather than intuition.
-
-The analysis is structured as six sequential steps, each building on the previous one:
-resource inventory → compute requirements → throughput model → memory sizing →
-module architecture → implementation plan.
-
-**Key outcomes at a glance:**
-
-| Question | Answer |
-|----------|--------|
-| How many parallel int8 MACs are available? | **220** (87 DSP blocks × 3, at 80% utilisation) |
-| How much on-chip BRAM is available? | **496 KB** (397 M10K blocks) |
-| Do all network weights fit in BRAM? | **No** — 19.2 MB total; only Conv1, Conv2, FC8 fit (120.5 KB) |
-| What is the v1 target throughput? | **~7 fps** (FC weight streaming from SDRAM is the bottleneck) |
-| What could v2 achieve with HPS offload of FC? | **~30 fps** (conv pipeline is DSP-bound at that point) |
-| Does the datapath infrastructure fit in BRAM? | **Yes** — 163 of 397 M10K blocks used (41%) |
-| Do sliding windows and accumulators fit in registers? | **Yes** — 56% of flip-flops used |
+No floating-point datapath is required.
 
 ---
 
-## Table of Contents
+## Current implementation status
 
-- [Step 1 — Hardware Baseline](#step-1--hardware-baseline)
-- [Step 2 — Network MAC Requirements & Weight Storage](#step-2--network-mac-requirements--weight-storage)
-- [Step 3 — Throughput Analysis & DSP Allocation](#step-3--throughput-analysis--dsp-allocation)
-- [Step 4 — Memory Architecture & BRAM Verification](#step-4--memory-architecture--bram-verification)
-- [Step 5 — RTL Block Diagram & Interface Definitions](#step-5--rtl-block-diagram--interface-definitions)
-- [Step 6 — Implementation Plan & Build Order](#step-6--implementation-plan--build-order)
+The current completed hardware milestone is:
+
+```text
+hardware/rtl/layers/conv_layer.vhd
+```
+
+The generic convolution layer currently supports:
+
+- unsigned 8-bit activation input;
+- signed 8-bit convolution weights;
+- signed 32-bit accumulation;
+- signed 32-bit per-channel bias;
+- ReLU;
+- unsigned 32-bit per-channel requantization multipliers;
+- unsigned 8-bit per-channel right shifts;
+- round-half-up requantization;
+- unsigned 8-bit saturation;
+- configurable input and output channels;
+- configurable kernel size;
+- configurable padding;
+- configurable stride;
+- parallel output-channel lanes;
+- multiple input channels;
+- multiple output-channel groups;
+- output backpressure;
+- stable raw and quantized outputs while stalled;
+- frame-completion signaling;
+- automatic restart for the next frame.
+
+The convolution implementation is bit-exact in simulation against all five exported
+convolution layers of AlexNet64Gray.
+
+Current real-vector result:
+
+```text
+Convolution real-vector results
+  Ran:    5 layers
+  Passed: 5 layers
+  Failed: 0 layers
+```
+
+The following blocks remain future implementation work:
+
+```text
+maxpool_layer
+fc_layer
+external-memory controller
+pipeline controller
+top-level pipeline integration
+argmax/output stage
+Quartus synthesis and timing validation
+```
 
 ---
 
-## Step 1 — Hardware Baseline
+## Planning-analysis notice
 
-The first step was to establish the exact resource budget of the target device from the
-official Intel datasheet, rather than relying on marketing figures. This matters because
-synthesis tools work with ALMs and DSP blocks, not "logic elements" — a discrepancy
-that commonly trips up early resource estimates.
+Steps 1 through 4 contain the original pre-implementation analysis.
+
+These sections document:
+
+- the device resource budget;
+- network operation counts;
+- weight-memory requirements;
+- proposed DSP allocation;
+- proposed BRAM and SDRAM placement;
+- theoretical throughput estimates.
+
+They are useful architectural planning references, but they are **not Quartus
+implementation results**.
+
+The completed `conv_layer` differs from some early assumptions, especially in:
+
+- line-buffer organization;
+- output-channel parallelism;
+- active weight-buffer size;
+- weight streaming;
+- MAC scheduling;
+- output width;
+- frame handling;
+- module decomposition.
+
+Actual ALM, register, M10K, MLAB, DSP, timing, and Fmax values must come from Quartus
+synthesis and place-and-route reports.
+
+---
+
+## Table of contents
+
+- [Step 1 — Hardware baseline](#step-1--hardware-baseline)
+- [Step 2 — Network compute and weight requirements](#step-2--network-compute-and-weight-requirements)
+- [Step 3 — Original throughput analysis](#step-3--original-throughput-analysis)
+- [Step 4 — Memory architecture](#step-4--memory-architecture)
+- [Step 5 — Current RTL architecture](#step-5--current-rtl-architecture)
+- [Step 6 — Verification status](#step-6--verification-status)
+- [Step 7 — Remaining implementation plan](#step-7--remaining-implementation-plan)
+
+---
+
+# Step 1 — Hardware baseline
+
+## 1.1 Target device
 
 **Target device:** Intel Cyclone V SE SoC — `5CSEMA5F31C6N`
 
-`5CSEMA5F31C6N` is the full ordering code. The base silicon designation used in Intel's
-product table is **5CSEA5** — confirmed by Altera's own product page:
-*"Cyclone® V SE FPGA 5CSEA5 (F31) — 5CSEMA5F31C6N"*
-([source](https://www.altera.com/products/fpga/cyclone/v/se/5csea5-f31/5CSEMA5F31C6N)).
+The base silicon designation used in Intel's product table is **5CSEA5**.
+
+Reference:
+
+[Altera Cyclone V SE FPGA 5CSEA5 F31](https://www.altera.com/products/fpga/cyclone/v/se/5csea5-f31/5CSEMA5F31C6N)
 
 | Field | Value | Meaning |
-|-------|-------|---------|
+|---|---:|---|
 | `5C` | Cyclone V | Device family |
-| `SE` | SE variant | SoC with integrated dual-core ARM Cortex-A9 HPS |
-| `A5` | Density code | 85K LEs (marketing), 32,070 ALMs (actual) |
-| `F31` | Package | 896-pin FBGA, 31×31 mm |
-| `C6` | Speed/temp | Commercial grade, speed grade 6 |
-| `N` | Packaging | Lead-free / RoHS — no effect on fabric resources |
-
-The `M` between `SE` and `A5` is an Altera catalog marker; it does not indicate a
-different silicon variant. All fabric resources are identical to the base 5CSEA5.
+| `SE` | SE variant | SoC with dual-core ARM Cortex-A9 HPS |
+| `A5` | Density code | 85K marketed LEs |
+| `F31` | Package | 896-pin FBGA |
+| `C6` | Speed grade | Commercial, speed grade 6 |
+| `N` | Packaging | Lead-free / RoHS |
 
 ---
 
-### 1.1 Resource Table
+## 1.2 Resource table
 
-All figures are from the Intel Cyclone V Product Table, row **"Cyclone V SE SoCs → 5CSEA5"**
-([Cyclone V FPGA and SoC FPGA Product Table — Intel, v2025.09.24](https://cdrdv2-public.intel.com/714207/cyclone-v-product-table.pdf)):
+Figures below come from the Cyclone V product table for the 5CSEA5 device.
+
+Reference:
+
+[Cyclone V FPGA and SoC FPGA Product Table](https://cdrdv2-public.intel.com/714207/cyclone-v-product-table.pdf)
 
 | Resource | Count | Notes |
-|----------|-------|-------|
-| LEs (Logic Elements) | 85K | Marketing figure |
-| ALMs (Adaptive Logic Modules) | **32,070** | True synthesizable unit |
-| Registers | 128,300 | Flip-flops inside ALMs |
-| M10K BRAM blocks | **397** | 10 Kb each |
-| M10K total memory | **3,970 Kb** | ≈ **496 KB** |
-| MLAB distributed memory | 480 Kb | LUT-based SRAM inside ALMs |
-| Variable-precision DSP blocks | **87** | One physical block each |
-| 18×18 multipliers | 174 | 87 × 2 — cross-checks DSP mode table |
-| PLLs (FPGA fabric) | 6 | |
-| HPS DDR3 SDRAM | 1 GB | Via HPS hard memory controller |
-| Dedicated SDRAM (IS42S16320F) | 64 MB | 16-bit bus, ~150 MB/s, FPGA-accessible |
+|---|---:|---|
+| Logic elements | 85K | Marketing figure |
+| Adaptive logic modules | **32,070** | Main synthesis unit |
+| Registers | **128,300** | Flip-flops inside ALMs |
+| M10K blocks | **397** | 10 Kbit memory blocks |
+| Total M10K memory | **3,970 Kbit** | Approximately 496 KB |
+| MLAB memory | 480 Kbit | LUT-based distributed memory |
+| Variable-precision DSP blocks | **87** | Physical DSP blocks |
+| 18×18 multipliers | 174 | Two per DSP block |
+| FPGA PLLs | 6 | |
+| HPS DDR3 | 1 GB | Through HPS memory controller |
+| FPGA-connected SDRAM | 64 MB | IS42S16320F, 16-bit bus |
 
-> The "85K LEs" figure from Terasic is a marketing aggregate.
-> The actual synthesizable unit is the **ALM** — 32,070 of them.
-> All resource estimates in this analysis use the ALM count.
+The 85K logic-element figure is a marketing aggregate.
 
----
+Resource reports should be interpreted using:
 
-### 1.2 DSP Block Modes
-
-Each of the 87 DSP blocks is **variable-precision**: a single block can be reconfigured
-at synthesis time to run in one of three modes. This is what makes the Cyclone V
-particularly efficient for integer neural network inference.
-
-| Mode | Multiplier size | Multiplications per block | Applicable to |
-|------|----------------|--------------------------|---------------|
-| 9×9 SIMD | 9-bit × 9-bit | **3** | int8 weights × uint8 activations |
-| 18×18 | 18-bit × 18-bit | **2** | Standard integer multiply |
-| 27×27 | 27-bit × 27-bit | **1** | High-precision (not needed here) |
-
-The 9×9 SIMD mode is directly applicable to this design: int8 weights (−127 to +127)
-and uint8 post-ReLU activations (0 to 255) both fit within 9 bits, so one DSP block
-can perform **three independent MACs simultaneously**.
-
-The 18×18 entry in the product table (174 = 87 × 2) independently cross-checks this figure.
+```text
+ALMs
+registers
+M10K blocks
+DSP blocks
+```
 
 ---
 
-### 1.3 Maximum Parallel MACs
+## 1.3 DSP block modes
 
-| DSP mode | MACs per block | Total blocks | Max parallel int8 MACs |
-|----------|---------------|--------------|------------------------|
-| 9×9 SIMD | 3 | 87 | **261** |
-| 18×18 | 2 | 87 | **174** |
+Each Cyclone V variable-precision DSP block can operate in several multiplier modes.
 
-A "MAC" here is one multiply-accumulate: `acc += weight(int8) × activation(uint8)`.
-The int32 accumulator lives in fabric registers — not inside the DSP block itself.
+| Mode | Multiplier size | Multiplications per DSP block |
+|---|---:|---:|
+| 9×9 SIMD | 9-bit × 9-bit | 3 |
+| 18×18 | 18-bit × 18-bit | 2 |
+| 27×27 | 27-bit × 27-bit | 1 |
 
-Synthesis tools and routing overhead consume some DSP capacity. A practical working
-budget of **80–85%** is used for all subsequent calculations:
+The 9×9 mode is relevant to this design because:
 
-| DSP mode | Practical budget |
-|----------|-----------------|
-| 9×9 SIMD | **~220 MACs** |
-| 18×18 | ~140–150 MACs |
+```text
+uint8 activation requires 9 signed bits after zero extension
+int8 weight requires 8 signed bits
+```
 
-All throughput analysis uses the 9×9 SIMD budget of **220 parallel MACs**.
+The theoretical maximum number of simultaneous 9×9 multiplications is:
 
----
+```text
+87 DSP blocks × 3 multipliers = 261 multiplications
+```
 
-### 1.4 BRAM Budget
+A planning budget of approximately 80–85% was used in the original analysis:
 
-Each M10K block stores 10 Kbits = **1,280 bytes**. With 397 blocks, the total on-chip
-memory is **496 KB**. This is the hard upper bound for on-chip weight storage —
-layers whose weights exceed this must stream from the 64 MB external SDRAM.
-The per-layer weight breakdown is computed in Step 2.
+```text
+approximately 220 parallel multiplications
+```
 
----
+This is only a planning target.
 
-## Step 2 — Network MAC Requirements & Weight Storage
-
-With the hardware budget established, the next step was to profile the network itself:
-how much compute does each layer require, and how much memory do its weights occupy?
-These figures drive every subsequent decision — DSP allocation, BRAM vs SDRAM placement,
-and which layers dominate throughput.
-
-The network is **AlexNet64Gray** (`ml/src/models/alexnet64gray.py`).
-Input: 1×64×64 grayscale. Output: 10 classes.
+Whether the implemented multipliers map to the expected DSP mode must be checked in
+Quartus.
 
 ---
 
-### 2.1 Per-Layer Dimensions
+## 1.4 On-chip memory budget
 
-| Layer | Input shape | Output shape | Kernel | Stride | Pad |
-|-------|------------|-------------|--------|--------|-----|
+Each M10K block stores:
+
+```text
+10 Kbit = 1,280 bytes
+```
+
+With 397 blocks:
+
+```text
+397 × 1,280 bytes ≈ 496 KB
+```
+
+This is not sufficient to store the complete model weight set, so external-memory
+weight storage is required for the larger layers.
+
+---
+
+# Step 2 — Network compute and weight requirements
+
+The network is:
+
+```text
+AlexNet64Gray
+```
+
+Source:
+
+```text
+ml/src/models/alexnet64gray.py
+```
+
+Input:
+
+```text
+1 × 64 × 64 grayscale image
+```
+
+Output:
+
+```text
+10 classes
+```
+
+---
+
+## 2.1 Layer dimensions
+
+| Layer | Input shape | Output shape | Kernel | Stride | Padding |
+|---|---|---|---:|---:|---:|
 | Conv1 | 1×64×64 | 64×64×64 | 5×5 | 1 | 2 |
-| MaxPool1 | 64×64×64 | 64×32×32 | 2×2 | 2 | — |
+| MaxPool1 | 64×64×64 | 64×32×32 | 2×2 | 2 | 0 |
 | Conv2 | 64×32×32 | 192×32×32 | 3×3 | 1 | 1 |
-| MaxPool2 | 192×32×32 | 192×16×16 | 2×2 | 2 | — |
+| MaxPool2 | 192×32×32 | 192×16×16 | 2×2 | 2 | 0 |
 | Conv3 | 192×16×16 | 384×16×16 | 3×3 | 1 | 1 |
 | Conv4 | 384×16×16 | 256×16×16 | 3×3 | 1 | 1 |
 | Conv5 | 256×16×16 | 256×16×16 | 3×3 | 1 | 1 |
-| MaxPool3 | 256×16×16 | 256×8×8 | 2×2 | 2 | — |
+| MaxPool3 | 256×16×16 | 256×8×8 | 2×2 | 2 | 0 |
 | FC6 | 16,384 | 1,024 | — | — | — |
 | FC7 | 1,024 | 1,024 | — | — | — |
 | FC8 | 1,024 | 10 | — | — | — |
 
 ---
 
-### 2.2 MACs per Image
+## 2.2 MACs per image
 
+For convolution:
+
+```text
+MACs =
+    C_OUT × H_OUT × W_OUT × C_IN × K_H × K_W
 ```
-Conv layer:  MACs = C_out × H_out × W_out × (C_in × K_h × K_w)
-FC layer:    MACs = C_out × C_in
-MaxPool:     no MACs — compare-and-select only
+
+For fully connected layers:
+
+```text
+MACs =
+    C_OUT × C_IN
 ```
 
 | Layer | Calculation | MACs |
-|-------|-------------|------|
-| Conv1 | 64 × 64×64 × (1×5×5) | **6.6M** |
-| Conv2 | 192 × 32×32 × (64×3×3) | **113M** |
-| Conv3 | 384 × 16×16 × (192×3×3) | **170M** |
-| Conv4 | 256 × 16×16 × (384×3×3) | **226M** |
-| Conv5 | 256 × 16×16 × (256×3×3) | **151M** |
-| FC6 | 1,024 × 16,384 | **16.8M** |
-| FC7 | 1,024 × 1,024 | **1.0M** |
-| FC8 | 10 × 1,024 | **<0.1M** |
-| **Total** | | **≈ 684M MACs / image** |
+|---|---|---:|
+| Conv1 | 64 × 64×64 × 1×5×5 | 6.6M |
+| Conv2 | 192 × 32×32 × 64×3×3 | 113M |
+| Conv3 | 384 × 16×16 × 192×3×3 | 170M |
+| Conv4 | 256 × 16×16 × 384×3×3 | 226M |
+| Conv5 | 256 × 16×16 × 256×3×3 | 151M |
+| FC6 | 1,024 × 16,384 | 16.8M |
+| FC7 | 1,024 × 1,024 | 1.0M |
+| FC8 | 10 × 1,024 | <0.1M |
+| **Total** | | **Approximately 684M** |
 
-Conv3 + Conv4 + Conv5 alone account for **547M MACs — 80% of all compute**.
-These three layers determine the throughput ceiling of the pipeline.
-
----
-
-### 2.3 Weight Storage
-
-```
-weights (bytes) = C_out × C_in × K_h × K_w    [int8, 1 byte each]
-biases  (bytes) = C_out × 4                    [int32, 4 bytes each]
-```
-
-| Layer | Weights | Biases | Total | Fits in 496 KB BRAM? |
-|-------|---------|--------|-------|----------------------|
-| Conv1 | 64×1×5×5 = 1,600 B | 256 B | **1.8 KB** | ✓ |
-| Conv2 | 192×64×3×3 = 110,592 B | 768 B | **108.7 KB** | ✓ |
-| Conv3 | 384×192×3×3 = 663,552 B | 1,536 B | **649.5 KB** | ✗ exceeds entire BRAM |
-| Conv4 | 256×384×3×3 = 884,736 B | 1,024 B | **865.0 KB** | ✗ |
-| Conv5 | 256×256×3×3 = 589,824 B | 1,024 B | **577.0 KB** | ✗ |
-| FC6 | 1,024×16,384 = 16,777,216 B | 4,096 B | **16.0 MB** | ✗ 32× over budget |
-| FC7 | 1,024×1,024 = 1,048,576 B | 4,096 B | **1.0 MB** | ✗ |
-| FC8 | 10×1,024 = 10,240 B | 40 B | **10.0 KB** | ✓ |
-| **Total** | | | **≈ 19.2 MB** | |
-
-The network is **39× larger than available BRAM**. This immediately establishes that
-most weights must live in external SDRAM and stream into the pipeline at runtime.
+Conv3, Conv4, and Conv5 account for most of the compute.
 
 ---
 
-### 2.4 On-Chip vs SDRAM Placement
+## 2.3 Weight storage
 
-| Layer | Weight size | Placement | Reason |
-|-------|------------|-----------|--------|
-| Conv1 | 1.8 KB | **BRAM** | Tiny; accessed every input pixel |
-| Conv2 | 108.7 KB | **BRAM** | Fits within budget |
-| Conv3 | 649.5 KB | **SDRAM** | Exceeds the full BRAM budget alone |
-| Conv4 | 865.0 KB | **SDRAM** | |
-| Conv5 | 577.0 KB | **SDRAM** | |
-| FC6 | 16.0 MB | **SDRAM** | |
-| FC7 | 1.0 MB | **SDRAM** | |
-| FC8 | 10.0 KB | **BRAM** | Negligible; fast output stage |
+For int8 weights:
 
-**BRAM allocation after weight placement:**
+```text
+weight_bytes =
+    C_OUT × C_IN × K_H × K_W
+```
 
-| Usage | Size |
-|-------|------|
-| Conv1 + Conv2 + FC8 weights & biases | 120.5 KB |
-| Remaining for line buffers, FIFOs, buffers | **375.5 KB** |
-| Total BRAM | 496 KB |
+For int32 biases:
 
-The 375.5 KB remainder is available for the streaming datapath infrastructure.
-Step 4 verifies this is sufficient.
+```text
+bias_bytes =
+    C_OUT × 4
+```
+
+| Layer | Weights | Biases | Approximate total |
+|---|---:|---:|---:|
+| Conv1 | 1,600 B | 256 B | 1.8 KB |
+| Conv2 | 110,592 B | 768 B | 108.7 KB |
+| Conv3 | 663,552 B | 1,536 B | 649.5 KB |
+| Conv4 | 884,736 B | 1,024 B | 865 KB |
+| Conv5 | 589,824 B | 1,024 B | 577 KB |
+| FC6 | 16,777,216 B | 4,096 B | 16 MB |
+| FC7 | 1,048,576 B | 4,096 B | 1 MB |
+| FC8 | 10,240 B | 40 B | 10 KB |
+| **Total** | | | **Approximately 19.2 MB** |
+
+The complete network is much larger than the available M10K memory.
 
 ---
 
-### 2.5 MACs per Output Pixel
+## 2.4 Original proposed weight placement
 
-This per-layer figure is used in Step 3 to derive DSP allocation.
-It represents the work required per spatial position, per output channel.
+The original architecture proposed the following system-level placement:
 
-```
-MACs per output pixel = C_in × K_h × K_w
-```
+| Layer | Proposed storage |
+|---|---|
+| Conv1 | On-chip memory |
+| Conv2 | On-chip memory |
+| Conv3 | External SDRAM |
+| Conv4 | External SDRAM |
+| Conv5 | External SDRAM |
+| FC6 | External SDRAM |
+| FC7 | External SDRAM |
+| FC8 | On-chip memory |
 
-| Layer | MACs / output pixel |
-|-------|---------------------|
-| Conv1 | 1×5×5 = **25** |
-| Conv2 | 64×3×3 = **576** |
-| Conv3 | 192×3×3 = **1,728** |
-| Conv4 | 384×3×3 = **3,456** |
-| Conv5 | 256×3×3 = **2,304** |
+This remains a useful system-level proposal.
 
-Conv4 is the most compute-intensive layer per output pixel and sets the throughput floor.
+It does **not** describe the current internal storage of `conv_layer`.
 
----
-
-## Step 3 — Throughput Analysis & DSP Allocation
-
-With the compute profile of the network established, the next step was to determine
-how fast the pipeline can run and how to allocate the 220 available DSPs across layers
-to maximise throughput.
-
-**v1 design choice:** all layers — including the FC layers — run entirely on the FPGA.
-No HPS offload. This keeps the first implementation simple and self-contained.
-Known performance limitations are documented in §3.5 with a clear path to improvement.
+The implemented convolution layer contains only an active working weight slice.
+The full layer weight tensor must be managed by an external provider.
 
 ---
 
-### 3.1 Throughput Model
+## 2.5 MACs per output channel and position
 
-The hardware uses a **spatial pipeline**: all layers are instantiated simultaneously
-and the image streams through them in order, like an assembly line.
-For the pipeline to be balanced, every stage must finish one image in the same number
-of cycles. If one stage is slower than the rest, it becomes the bottleneck and the
-entire pipeline runs at its rate.
-
-Given a fixed DSP budget `D` and allocating DSPs proportionally to each layer's
-MAC count, every layer achieves the same cycles-per-image and:
-
+```text
+MACs per output channel and spatial position =
+    C_IN × K_H × K_W
 ```
-T_total = sum(all MACs) / D
-P_i     = total_MACs_i × D / sum(all MACs)    (DSPs for layer i)
-```
+
+| Layer | MACs per output channel and position |
+|---|---:|
+| Conv1 | 25 |
+| Conv2 | 576 |
+| Conv3 | 1,728 |
+| Conv4 | 3,456 |
+| Conv5 | 2,304 |
+
+Conv4 has the largest accumulation depth.
 
 ---
 
-### 3.2 Per-Layer DSP Allocation
+# Step 3 — Original throughput analysis
 
-Using the 220-MAC practical budget (9×9 SIMD mode, 80% utilisation):
+This section preserves the original throughput-planning model.
 
-| Layer | Total MACs | Share | DSPs | Cycles / image |
-|-------|-----------|-------|------|----------------|
-| Conv1 | 6.6M | 1.0% | **2** | 3,277K |
-| Conv2 | 113M | 16.5% | **36** | 3,146K |
-| Conv3 | 170M | 24.8% | **55** | 3,089K |
-| Conv4 | 226M | 33.0% | **73** | 3,101K |
-| Conv5 | 151M | 22.0% | **48** | 3,146K |
-| FC6 | 16.8M | 2.5% | **5** | 3,356K |
-| FC7 + FC8 | ~1M | <0.2% | — | shared with FC6 |
-| **Total** | **685M** | 100% | **219** | |
+The values below are not measured from the current RTL.
 
-FC7 and FC8 round to zero DSPs at this scale. In practice they time-multiplex
-with FC6's MAC array.
+---
 
-**Pipeline bottleneck: Conv1 at 3,277K cycles.**
+## 3.1 Original spatial-pipeline assumption
 
+The original system proposal instantiated all major layers concurrently as a spatial
+pipeline.
+
+With total compute work `M_TOTAL` and a parallel multiplication budget `D`, the ideal
+balanced latency was approximated as:
+
+```text
+cycles_per_image ≈ M_TOTAL / D
 ```
-T_total  = 3,277,000 cycles
-At 100 MHz → 32.8 ms per image → ~30 fps  (if memory bandwidth were not a constraint)
+
+A proportional allocation was estimated using:
+
+```text
+P_i =
+    layer_MACs_i × D / total_MACs
 ```
 
 ---
 
-### 3.3 SDRAM Bandwidth Check
+## 3.2 Original DSP allocation estimate
 
-The DSP analysis alone suggests ~30 fps. However, layers using SDRAM-stored weights
-must read those weights from the external memory chip during each image pass.
-This introduces a bandwidth constraint that must be checked separately.
+Using a planning budget of approximately 220 parallel multiplications:
 
-| Data | Size | Time at 150 MB/s |
-|------|------|-----------------|
+| Layer | Total MACs | Original allocation estimate |
+|---|---:|---:|
+| Conv1 | 6.6M | 2 |
+| Conv2 | 113M | 36 |
+| Conv3 | 170M | 55 |
+| Conv4 | 226M | 73 |
+| Conv5 | 151M | 48 |
+| FC6 | 16.8M | 5 |
+| FC7 and FC8 | Approximately 1M | Shared |
+| **Total** | Approximately 685M | **219** |
+
+This estimate assumed a different degree of internal parallelism than the current
+`conv_layer`.
+
+The implemented generic:
+
+```text
+G_C_PAR
+```
+
+specifies the number of output channels calculated in parallel.
+
+It is not a direct statement of how many independent complete MAC operations occur
+per clock.
+
+---
+
+## 3.3 Original memory-bandwidth estimate
+
+The original analysis assumed approximately 150 MB/s from the FPGA-connected SDRAM.
+
+| Data | Size | Ideal transfer time at 150 MB/s |
+|---|---:|---:|
 | Conv3 weights | 649.5 KB | 4.3 ms |
-| Conv4 weights | 865.0 KB | 5.8 ms |
-| Conv5 weights | 577.0 KB | 3.8 ms |
-| **Conv subtotal** | **2.09 MB** | **13.9 ms** |
-| FC6 weights | 16.0 MB | 106.7 ms |
-| FC7 weights | 1.0 MB | 6.7 ms |
-| **FC subtotal** | **17.0 MB** | **113.3 ms** |
+| Conv4 weights | 865 KB | 5.8 ms |
+| Conv5 weights | 577 KB | 3.8 ms |
+| FC6 weights | 16 MB | 106.7 ms |
+| FC7 weights | 1 MB | 6.7 ms |
 
-The conv weight streaming (13.9 ms) fits inside the 32.8 ms compute window —
-the memory controller can prefetch weights while the DSPs are already computing. No problem there.
+The original estimated throughput was:
 
-The FC layers are a different story. The FC6 weight matrix alone is 16 MB.
-At 150 MB/s that takes 107 ms to read — while the actual MAC computation for FC
-would take only ~30 ms with 5 DSPs. The FC stage is **~4× memory-bandwidth-bound**,
-not compute-bound.
-
-**Effective v1 throughput:**
-```
-T = 32.8 ms (conv, DSP-bound) + 113.3 ms (FC, bandwidth-bound)
-  ≈ 146 ms per image  →  ~7 fps
+```text
+approximately 7 frames per second for an all-FPGA v1
+approximately 30 frames per second after removing the FC bandwidth bottleneck
 ```
 
----
+These numbers remain planning estimates only.
 
-### 3.4 Known Limitations & Future Optimisations
+Actual throughput depends on:
 
-These are documented here as a clear upgrade path once v1 is working end-to-end.
-
-| # | Optimisation | Expected gain | Complexity |
-|---|-------------|---------------|-----------|
-| 1 | **Offload FC to HPS ARM** — Cortex-A9 with NEON does ~4 MACs/cycle; FC6 completes in ~5 ms, overlapped with FPGA processing the next frame | Full conv pipeline at ~30 fps | Medium — HPS↔FPGA handshake |
-| 2 | **Stream FC weights via DDR3 (HPS)** — 1 GB DDR3 has far higher bandwidth; keeps FC on FPGA but removes the bandwidth wall | ~4–8× FC bandwidth | Medium — Avalon/AXI bridge |
-| 3 | **Replace FC with Global Average Pooling** — eliminates FC6/FC7 entirely; small linear classifier replaces them | Near-zero FC bandwidth cost | High — requires retraining |
-| 4 | **Weight double-buffering** — DMA pre-fetches FC weights for frame N+1 while frame N is being processed | Partially hides weight-load latency | Low–Medium |
-
-**v1 target: ~7 fps, end-to-end on FPGA hardware.**
-**v2 target: ~30 fps via option 1 or 2 above.**
+- synthesized clock frequency;
+- DSP inference;
+- memory-controller efficiency;
+- burst length;
+- FIFO depth;
+- weight reuse;
+- backpressure;
+- layer scheduling;
+- top-level pipeline architecture.
 
 ---
 
-## Step 4 — Memory Architecture & BRAM Verification
+## 3.4 Possible future optimizations
 
-Before committing to the architecture, every piece of on-chip memory used by the
-streaming datapath was sized and totalled to confirm the design fits within the
-available 397 M10K blocks. The analysis also accounts for fabric flip-flop usage,
-since sliding window registers are a non-trivial consumer.
-
-All activations are uint8 (1 byte). All weights are int8 (1 byte). Biases int32 (4 bytes).
-Each M10K block = 10 Kbits = **1,280 bytes**.
-
-**Five memory categories:**
-1. Line buffers — store buffered rows so each conv layer can form its K×K sliding window
-2. MaxPool row buffers — hold one input row for the 2×2 max comparison
-3. On-chip weight banks — BRAM storage for Conv1, Conv2, FC8
-4. FC6 input activation buffer — flattened Pool3 output, held while FC layers run
-5. SDRAM weight FIFOs — small burst buffers per SDRAM-mapped layer to absorb SDRAM latency
+| Optimization | Intended benefit |
+|---|---|
+| HPS offload of fully connected layers | Remove FPGA FC bandwidth bottleneck |
+| HPS DDR3 weight streaming | Higher weight bandwidth |
+| Global average pooling | Remove FC6 and FC7 |
+| Weight double buffering | Hide some memory latency |
+| Larger output-channel parallelism | Reduce group count |
+| Weight prefetching | Reduce MAC stalls |
+| Layer-specific scheduling | Better resource sharing |
 
 ---
 
-### 4.1 Line Buffers
+# Step 4 — Memory architecture
 
-As pixels arrive row by row, a K×K conv layer must hold K−1 complete rows in BRAM
-to form the sliding window at each position.
+## 4.1 Current convolution line-buffer organization
 
-```
-line_buffer_bytes = (K − 1) × W_in × C_in
+The implemented `conv_layer` uses:
+
+```text
+G_KERNEL active physical row buffers
+one spare physical row buffer
 ```
 
-| Layer | Kernel | Buffered rows | W_in | C_in | Bytes | M10K |
-|-------|--------|--------------|------|------|-------|------|
-| Conv1 | 5×5 | 4 | 64 | 1 | 256 B | 1 |
-| Conv2 | 3×3 | 2 | 32 | 64 | 4,096 B | 4 |
-| Conv3 | 3×3 | 2 | 16 | 192 | 6,144 B | 5 |
-| Conv4 | 3×3 | 2 | 16 | 384 | 12,288 B | 10 |
-| Conv5 | 3×3 | 2 | 16 | 256 | 8,192 B | 7 |
-| | | | | **Subtotal** | **30.5 KB** | **27** |
+The physical line-buffer array therefore contains:
 
----
-
-### 4.2 MaxPool Row Buffers
-
-A 2×2 max pool compares pixels from two consecutive input rows.
-It buffers one complete input row while waiting for the row below it to arrive.
-
-```
-pool_buffer_bytes = W_in × C_in
+```text
+G_KERNEL + 1 rows
 ```
 
-| Pool | Input from | W_in | C_in | Bytes | M10K |
-|------|-----------|------|------|-------|------|
-| Pool1 | Conv1 output | 64 | 64 | 4,096 B | 4 |
-| Pool2 | Conv2 output | 32 | 192 | 6,144 B | 5 |
-| Pool3 | Conv5 output | 16 | 256 | 4,096 B | 4 |
-| | | | **Subtotal** | **14.3 KB** | **13** |
+Each row stores:
 
----
-
-### 4.3 On-Chip Weight Banks
-
-```
-weight_bank_bytes = (C_out × C_in × K_h × K_w) + (C_out × 4)
-                     int8 weights                  int32 biases
+```text
+G_W_IN × G_C_IN bytes
 ```
 
-| Layer | Weights | Biases | Total | M10K |
-|-------|---------|--------|-------|------|
-| Conv1 | 64×1×5×5 = 1,600 B | 256 B | 1,856 B | 2 |
-| Conv2 | 192×64×3×3 = 110,592 B | 768 B | 111,360 B | 87 |
-| FC8 | 10×1,024 = 10,240 B | 40 B | 10,280 B | 9 |
-| | | **Subtotal** | **120.5 KB** | **98** |
+The logical storage size is:
 
-Conv2 alone consumes 87 M10K blocks — the single largest consumer at 22% of the total
-BRAM budget. This is unavoidable given the weight tensor size.
-
----
-
-### 4.4 FC6 Input Activation Buffer
-
-After Pool3, the 256×8×8 activation map (16,384 values) must be held in BRAM
-while the FC stages process the full vector sequentially.
-
-| Buffer | Size | M10K |
-|--------|------|------|
-| FC6 input (flattened Pool3 output) | 16,384 B (16 KB) | 13 |
-
----
-
-### 4.5 SDRAM Weight Streaming FIFOs
-
-Each SDRAM-mapped layer has a small on-chip FIFO that absorbs burst latency from the
-external memory controller, decoupling it from the MAC pipeline's cycle-accurate timing.
-Each FIFO holds one filter slice — the weights for a single output channel — ensuring
-the MAC array always has the next set of weights ready without stalling.
-
-| Layer | FIFO holds | Size | M10K |
-|-------|-----------|------|------|
-| Conv3 | one 192×3×3 filter | 1,728 B | 2 |
-| Conv4 | one 384×3×3 filter | 3,456 B | 3 |
-| Conv5 | one 256×3×3 filter | 2,304 B | 2 |
-| FC6 | burst cap | 4,096 B | 4 |
-| FC7 | one FC row | 1,024 B | 1 |
-| | **Subtotal** | **12.6 KB** | **12** |
-
----
-
-### 4.6 Sliding Window Registers
-
-The active K×K pixel neighbourhood used each cycle to form the convolution operand
-lives in fabric flip-flops, not BRAM. BRAM has a 1–2 cycle read latency and cannot
-provide the simultaneous arbitrary access the MAC array needs every clock cycle.
-Registers are zero-latency and fully parallel.
-
-```
-sliding_window_FFs = K_h × K_w × C_in × 8
+```text
+line_buffer_bytes =
+    (G_KERNEL + 1) × G_W_IN × G_C_IN
 ```
 
-| Layer | Window size | Flip-flops |
-|-------|------------|-----------|
-| Conv1 | 5×5×1 | 200 |
-| Conv2 | 3×3×64 | 4,608 |
-| Conv3 | 3×3×192 | 13,824 |
-| Conv4 | 3×3×384 | **27,648** |
-| Conv5 | 3×3×256 | 18,432 |
-| **Subtotal** | | **64,712 FFs** |
-
-Conv4's sliding window alone consumes 27,648 FFs. This is the tightest register
-constraint in the design, though it remains within budget.
-
-**Int32 accumulators** — one per parallel MAC unit, also in fabric registers:
-
-| Layer | Parallel MACs | FFs |
-|-------|--------------|-----|
-| Conv1 | 2 | 64 |
-| Conv2 | 36 | 1,152 |
-| Conv3 | 55 | 1,760 |
-| Conv4 | 73 | 2,336 |
-| Conv5 | 48 | 1,536 |
-| FC6 | 5 | 160 |
-| **Subtotal** | | **7,008 FFs** |
+The exact M10K or MLAB usage depends on Quartus packing and inference.
 
 ---
 
-### 4.7 BRAM Tally — Go / No-Go
+## 4.2 Logical row mapping
 
-| Category | M10K blocks | KB |
-|----------|------------|-----|
-| Line buffers | 27 | 33.8 |
-| MaxPool row buffers | 13 | 16.3 |
-| On-chip weight banks | 98 | 122.5 |
-| FC6 activation buffer | 13 | 16.3 |
-| SDRAM weight FIFOs | 12 | 15.0 |
-| **Total used** | **163** | **203.8** |
-| **Available** | **397** | **496.2** |
-| **Remaining headroom** | **234** | **292.5** |
+The convolution window does not copy complete rows during vertical movement.
 
-**BRAM: GO.** 41% utilisation. 234 M10K blocks remain for inter-stage FIFOs,
-control registers, and any additions during implementation.
+Instead, the RTL maintains:
 
----
+```text
+row_map
+row_valid
+spare_row
+```
 
-### 4.8 Flip-Flop Tally — Go / No-Go
+For a three-row logical window:
 
-| Category | FFs | % of 128,300 |
-|----------|-----|-------------|
-| Sliding window registers | 64,712 | 50.4% |
-| Int32 accumulators | 7,008 | 5.5% |
-| **Total committed** | **71,720** | **55.9%** |
-| **Remaining for control/pipeline** | **56,580** | **44.1%** |
+```text
+before rotation:
+    logical row 0 → physical row A
+    logical row 1 → physical row B
+    logical row 2 → physical row C
+    spare row     → physical row D
 
-**Registers: GO.** 44% of flip-flops remain for control FSMs, pipeline stage registers,
-requantisation logic, and SDRAM controller state.
+after rotation:
+    logical row 0 → physical row B
+    logical row 1 → physical row C
+    logical row 2 → physical row D
+    spare row     → physical row A
+```
 
----
+Only row roles change.
 
-## Step 5 — RTL Block Diagram & Interface Definitions
-
-With the resource analysis complete, the next step was to define every RTL module,
-its interface, and how they connect — before writing any VHDL. This blueprint ensures
-that the implementation phase is free to focus on correctness rather than architecture.
-
-A key design principle throughout is **parameterisation**: every layer module is fully
-generic, driven by constants in the top-level instantiation. Changing a layer's channel
-count, kernel size, or parallelism requires only editing the generic map — no internal
-RTL changes.
+Physical activation contents are not copied.
 
 ---
 
-### 5.1 Overall System Architecture
+## 4.3 Padding representation
 
-The following diagram shows the complete data path between the HPS, FPGA memory
-interfaces, streaming CNN stages, external weight memory, and result path.
+Top and bottom padding rows are represented with:
+
+```text
+row_valid = 0
+```
+
+Left and right padding positions are detected by the calculated input-column index.
+
+Padded activation values are generated internally as zero.
+
+No padding bytes are consumed from the activation stream.
+
+---
+
+## 4.4 Current active weight buffer
+
+The implemented convolution layer does not hold the complete layer weight tensor.
+
+It contains one active slice:
+
+```text
+G_C_PAR × G_KERNEL × G_KERNEL signed int8 weights
+```
+
+This slice corresponds to:
+
+```text
+G_C_PAR output channels
+for one input-channel contribution
+```
+
+The full model weight tensor remains external to the layer.
+
+The weight source may eventually be implemented using:
+
+- on-chip ROM or RAM;
+- an M10K-backed cache;
+- a FIFO;
+- external SDRAM;
+- HPS DDR3;
+- DMA or Avalon-MM infrastructure.
+
+The storage mechanism is external to `conv_layer`.
+
+---
+
+## 4.5 Bias and requantization storage
+
+The current layer stores the following values for every output channel:
+
+```text
+signed int32 bias
+unsigned uint32 requantization multiplier
+unsigned uint8 requantization shift
+```
+
+Logical storage requirement:
+
+```text
+G_C_OUT × (4 + 4 + 1) bytes
+```
+
+These values are loaded through the configuration-write interface and remain stored
+across frame restarts.
+
+---
+
+## 4.6 Accumulator storage
+
+The RTL contains:
+
+```text
+G_C_PAR signed 32-bit accumulators
+```
+
+It also contains:
+
+```text
+G_C_PAR signed 32-bit raw result registers
+G_C_PAR unsigned 8-bit quantized result registers
+```
+
+These holding registers keep both outputs stable during backpressure.
+
+---
+
+## 4.7 Sequential kernel traversal
+
+The current implementation does not materialize the complete:
+
+```text
+K × K × C_IN
+```
+
+activation window as one large fully parallel register array.
+
+Instead, it walks through:
+
+```text
+kernel position
+input channel
+```
+
+over multiple cycles while calculating:
+
+```text
+G_C_PAR output lanes in parallel
+```
+
+This significantly changes the register and DSP estimates from the original
+pre-implementation architecture.
+
+---
+
+## 4.8 Resource-report policy
+
+The following earlier estimates should not be presented as implementation results:
+
+```text
+163 M10K blocks
+71,720 flip-flops
+219 allocated DSP lanes
+30 fps convolution pipeline
+7 fps complete pipeline
+```
+
+They remain planning estimates.
+
+The authoritative implementation values must come from:
+
+```text
+Quartus Analysis and Synthesis
+Quartus Fitter
+TimeQuest Timing Analyzer
+DSP utilization reports
+RAM inference reports
+```
+
+---
+
+# Step 5 — Current RTL architecture
+
+## 5.1 Current file organization
+
+Current implemented convolution files include:
+
+```text
+hardware/rtl/layers/conv_layer.vhd
+
+verification/tb/conv/
+verification/tb/layers/
+
+verification/sim/run_conv.sh
+verification/sim/run_conv_traversal.sh
+verification/sim/run_layers.sh
+```
+
+The current convolution layer is implemented as one RTL architecture containing
+multiple concurrent worker processes.
+
+It is not currently decomposed into separate:
+
+```text
+line_buffer.vhd
+mac_array.vhd
+requant_unit.vhd
+weight_bram.vhd
+```
+
+entities.
+
+Those components may be extracted later as a refactoring, but the verified
+implementation is presently contained inside `conv_layer.vhd`.
+
+---
+
+## 5.2 Current `conv_layer` generics
+
+```vhdl
+generic (
+    G_C_IN    : positive;
+    G_C_OUT   : positive;
+    G_W_IN    : positive;
+    G_H_IN    : positive;
+    G_C_PAR   : positive;
+    G_KERNEL  : positive;
+    G_PADDING : natural;
+    G_STRIDE  : positive
+);
+```
+
+### Generic meanings
+
+| Generic | Meaning |
+|---|---|
+| `G_C_IN` | Number of input channels |
+| `G_C_OUT` | Number of output channels |
+| `G_W_IN` | Input tensor width |
+| `G_H_IN` | Input tensor height |
+| `G_C_PAR` | Output channels calculated in parallel |
+| `G_KERNEL` | Square convolution-kernel size |
+| `G_PADDING` | Symmetric zero padding |
+| `G_STRIDE` | Equal horizontal and vertical stride |
+
+The current implementation requires:
+
+```text
+G_C_OUT mod G_C_PAR = 0
+```
+
+---
+
+## 5.3 Current entity interface
+
+```vhdl
+port (
+    clk   : in std_logic;
+    rst_n : in std_logic;
+
+    i_valid : in  std_logic;
+    i_ready : out std_logic;
+    i_data  : in  std_logic_vector(7 downto 0);
+
+    i_weight_valid : in  std_logic;
+    o_weight_ready : out std_logic;
+    i_weight_data  : in  std_logic_vector(7 downto 0);
+
+    cfg_we    : in std_logic;
+    cfg_sel   : in std_logic_vector(1 downto 0);
+    cfg_addr  : in std_logic_vector(19 downto 0);
+    cfg_wdata : in std_logic_vector(31 downto 0);
+
+    o_valid : out std_logic;
+    o_data  : out std_logic_vector(G_C_PAR * 8 - 1 downto 0);
+
+    o_done : out std_logic;
+
+    i_acc_ready : in  std_logic;
+    o_acc_valid : out std_logic;
+    o_acc_data  : out std_logic_vector(G_C_PAR * 32 - 1 downto 0)
+);
+```
+
+The reset is synchronous and active low.
+
+---
+
+## 5.4 Activation input protocol
+
+```vhdl
+i_valid : in  std_logic;
+i_ready : out std_logic;
+i_data  : in  std_logic_vector(7 downto 0);
+```
+
+A transfer occurs when:
+
+```text
+i_valid = 1
+and
+i_ready = 1
+```
+
+Activations are unsigned 8-bit values.
+
+Input order is:
+
+```text
+input row
+    → input column
+        → input channel
+```
+
+No padding bytes are supplied by the source.
+
+The layer generates zero padding internally.
+
+---
+
+## 5.5 Weight input protocol
+
+```vhdl
+i_weight_valid : in  std_logic;
+o_weight_ready : out std_logic;
+i_weight_data  : in  std_logic_vector(7 downto 0);
+```
+
+A transfer occurs when:
+
+```text
+i_weight_valid = 1
+and
+o_weight_ready = 1
+```
+
+Weights are interpreted as signed 8-bit values.
+
+One complete accepted batch contains:
+
+```text
+G_C_PAR × G_KERNEL × G_KERNEL bytes
+```
+
+Batch order is lane-major:
+
+```text
+lane 0:
+    kernel row 0
+    kernel row 1
+    ...
+
+lane 1:
+    kernel row 0
+    kernel row 1
+    ...
+
+...
+
+lane G_C_PAR - 1
+```
+
+Kernel values within each lane are row-major.
+
+The external provider must respond to the requests generated by the layer.
+
+Current request patterns are:
+
+### Single input channel and one output group
+
+```text
+one initial weight batch
+reused across the complete frame
+```
+
+### Single input channel and multiple output groups
+
+```text
+output row
+    → output group
+```
+
+### Multiple input channels
+
+```text
+output row
+    → output group
+        → output column
+            → input channel
+```
+
+The testbench weight driver follows the actual `o_weight_ready` handshake rather
+than assuming fixed timing.
+
+---
+
+## 5.6 Parameter configuration interface
+
+```vhdl
+cfg_we    : in std_logic;
+cfg_sel   : in std_logic_vector(1 downto 0);
+cfg_addr  : in std_logic_vector(19 downto 0);
+cfg_wdata : in std_logic_vector(31 downto 0);
+```
+
+`cfg_addr` is the absolute output-channel index.
+
+Selections:
+
+```text
+cfg_sel = "01" → signed int32 bias
+cfg_sel = "10" → unsigned uint32 requantization multiplier
+cfg_sel = "11" → unsigned uint8 requantization right shift
+cfg_sel = "00" → reserved
+```
+
+Bias and multiplier use all 32 bits.
+
+Right shift uses:
+
+```vhdl
+cfg_wdata(7 downto 0)
+```
+
+Parameter writes outside the implemented output-channel range are ignored.
+
+Parameters must be configured before frame processing begins.
+
+They remain loaded across automatic frame restarts.
+
+---
+
+## 5.7 Quantized output protocol
+
+```vhdl
+o_valid : out std_logic;
+o_data  : out std_logic_vector(G_C_PAR * 8 - 1 downto 0);
+```
+
+Each transfer contains:
+
+```text
+G_C_PAR output-channel activations
+```
+
+Lane `n` occupies:
+
+```vhdl
+o_data((n + 1) * 8 - 1 downto n * 8)
+```
+
+Output stream order is:
+
+```text
+output row
+    → output group
+        → output column
+            → lane
+```
+
+Absolute output channel:
+
+```text
+output_channel =
+    output_group × G_C_PAR + lane
+```
+
+The current quantized output does not have a separate ready input.
+
+It shares:
+
+```vhdl
+i_acc_ready
+```
+
+with the raw accumulator output.
+
+A quantized transfer is accepted when:
+
+```text
+o_valid = 1
+and
+i_acc_ready = 1
+```
+
+---
+
+## 5.8 Raw accumulator debug interface
+
+```vhdl
+i_acc_ready : in  std_logic;
+o_acc_valid : out std_logic;
+o_acc_data  : out std_logic_vector(G_C_PAR * 32 - 1 downto 0);
+```
+
+The raw accumulator output is retained for debugging and verification.
+
+Lane `n` occupies:
+
+```vhdl
+o_acc_data((n + 1) * 32 - 1 downto n * 32)
+```
+
+The value is the signed int32 convolution sum before:
+
+```text
+bias
+ReLU
+requantization
+saturation
+```
+
+The raw and quantized outputs represent the same tensor position.
+
+Current implementation:
+
+```text
+o_valid = o_acc_valid
+```
+
+While stalled:
+
+```text
+o_valid = 1
+and
+i_acc_ready = 0
+```
+
+both:
+
+```text
+o_data
+o_acc_data
+```
+
+remain stable.
+
+---
+
+## 5.9 Frame completion and restart
+
+```vhdl
+o_done : out std_logic;
+```
+
+`o_done` pulses for one clock after:
+
+```text
+the final output transfer has been accepted
+all required trailing input rows have been drained
+the layer has completed its final logical row rotation
+```
+
+The controller then returns to:
+
+```text
+S_IDLE
+```
+
+The logical line-buffer state is reinitialized:
+
+```text
+row_map
+row_valid
+spare_row
+logical_top_row
+output-row counter
+vertical-stride counter
+drain state
+```
+
+The physical line-buffer RAM does not need to be cleared.
+
+Real rows are overwritten before being used, and virtual rows are suppressed through
+the row-valid flags.
+
+After completion, the layer automatically starts preparing the next frame.
+
+A global reset is not required between frames.
+
+---
+
+## 5.10 Output dimensions
+
+```text
+padded_width =
+    G_W_IN + 2 × G_PADDING
+
+padded_height =
+    G_H_IN + 2 × G_PADDING
+```
+
+```text
+output_width =
+    ((padded_width - G_KERNEL) / G_STRIDE) + 1
+
+output_height =
+    ((padded_height - G_KERNEL) / G_STRIDE) + 1
+```
+
+Integer division follows the normal convolution output-size rule.
+
+---
+
+## 5.11 Horizontal traversal
+
+For output column `x` and kernel column `kx`:
+
+```text
+input_column =
+    x × G_STRIDE + kx - G_PADDING
+```
+
+When:
+
+```text
+input_column < 0
+or
+input_column >= G_W_IN
+```
+
+the activation value is zero.
+
+The controller waits until sufficient real input columns have been received before
+calculating the next output position.
+
+---
+
+## 5.12 Vertical stride
+
+Vertical stride is implemented with repeated logical row rotations.
+
+The signal:
+
+```text
+vertical_advance_remaining
+```
+
+tracks the additional row advances required before the next output row can be
+calculated.
+
+For example:
+
+```text
+stride 1 → one logical row advance
+stride 2 → two logical row advances
+stride 3 → three logical row advances
+```
+
+Rows that must still be consumed from the activation stream but do not contribute to
+another output position are drained before `o_done`.
+
+---
+
+## 5.13 Supported arithmetic
+
+For output channel `c`:
+
+```text
+raw_acc[c] =
+    Σ(
+        uint8_activation
+        ×
+        int8_weight
+    )
+```
+
+Bias addition:
+
+```text
+biased_acc[c] =
+    raw_acc[c] + signed_int32_bias[c]
+```
+
+ReLU:
+
+```text
+relu_acc[c] =
+    max(biased_acc[c], 0)
+```
+
+Unsigned multiplication:
+
+```text
+product[c] =
+    uint64(relu_acc[c])
+    ×
+    uint32(requant_multiplier[c])
+```
+
+Round-half-up:
+
+```text
+if requant_shift[c] > 0:
+    product[c] += 2^(requant_shift[c] - 1)
+```
+
+Logical right shift:
+
+```text
+shifted[c] =
+    product[c] >> requant_shift[c]
+```
+
+Saturation:
+
+```text
+output[c] =
+    min(shifted[c], 255)
+```
+
+There is currently no output-zero-point addition.
+
+Negative values are removed before multiplication, so no signed negative rounding
+rule is required.
+
+---
+
+## 5.14 Controller state machine
+
+The main controller uses six states:
+
+```vhdl
+type conv_states is (
+    S_IDLE,
+    S_INITIAL_LINE_FILL,
+    S_PRIME_K_LINE,
+    S_CALC_AND_SLIDING_WINDOW,
+    S_STREAM_LINE_FILLING,
+    S_LINE_ROTATION
+);
+```
+
+The architecture also contains concurrent worker processes for:
+
+```text
+initial activation filling
+prime-row filling
+stream-row filling
+weight loading
+line-buffer writing
+MAC calculation
+output holding
+parameter loading
+logical row rotation
+```
+
+Weight loading is not a separate main FSM state.
+
+---
+
+### `S_IDLE`
+
+Starts a new frame.
+
+Entering this state begins:
+
+```text
+initial activation filling
+first weight-batch loading
+```
+
+Frame traversal state is restored for the new tensor.
+
+---
+
+### `S_INITIAL_LINE_FILL`
+
+Loads the first real input rows required by the initial padded kernel window.
+
+The number of initial real rows is:
+
+```text
+G_KERNEL - G_PADDING - 1
+```
+
+---
+
+### `S_PRIME_K_LINE`
+
+Loads the first `G_KERNEL` columns of the bottom logical kernel row when that row is
+a real input row.
+
+For a virtual padding row, no input bytes are consumed.
+
+The state waits until:
+
+```text
+first_window_ready = 1
+```
+
+and, when calculation is required:
+
+```text
+weight_group_ready = 1
+```
+
+---
+
+### `S_CALC_AND_SLIDING_WINDOW`
+
+Calculates all output columns for the current output-channel group.
+
+The output ordering within an output row is:
+
+```text
+group 0:
+    all output columns
+
+group 1:
+    all output columns
+
+...
+
+final group:
+    all output columns
+```
+
+For multiple input channels, accumulation is preserved while each input-channel
+weight slice is processed.
+
+---
+
+### `S_STREAM_LINE_FILLING`
+
+Completes the remaining activation bytes required for the next physical row.
+
+For a virtual bottom-padding row, the worker completes without consuming input bytes.
+
+This operation is controlled independently from the MAC worker and can overlap with
+parts of calculation.
+
+---
+
+### `S_LINE_ROTATION`
+
+Rotates logical row roles.
+
+The state decides whether:
+
+```text
+another stride-related row advance is needed
+another output row remains
+trailing real input rows must be drained
+or
+the frame is complete
+```
+
+When the frame is complete:
+
+```text
+o_done pulses
+state returns to S_IDLE
+the next frame can begin
+```
+
+---
+
+## 5.15 Current implementation constraints
+
+The current implementation assumes:
+
+```text
+G_C_OUT mod G_C_PAR = 0
+G_PADDING <= G_KERNEL - 2
+G_W_IN > G_KERNEL
+G_W_IN + 2 × G_PADDING >= G_KERNEL
+G_H_IN + 2 × G_PADDING >= G_KERNEL
+square kernels
+equal horizontal and vertical stride
+uint8 activations
+int8 weights
+signed int32 accumulation
+unsigned uint32 requantization multiplier
+unsigned uint8 requantization shift
+```
+
+Not currently supported:
+
+```text
+partially populated final output group
+dilation greater than one
+different horizontal and vertical strides
+non-square kernels
+output zero-point addition
+```
+
+---
+
+## 5.16 Current internal hierarchy
+
+```text
+conv_layer
+├── six-state main controller
+├── physical line-buffer array
+├── logical row map
+├── row-valid padding map
+├── initial-line-fill worker
+├── prime-line-fill worker
+├── stream-line-fill worker
+├── weight-buffer loader
+├── active weight buffer
+├── MAC and horizontal traversal worker
+├── raw accumulator registers
+├── bias parameter memory
+├── requant multiplier memory
+├── requant shift memory
+├── quantized result registers
+├── output holding/backpressure control
+├── vertical stride control
+├── trailing-input drain control
+└── completion/restart control
+```
+
+---
+
+## 5.17 Overall planned system architecture
+
+The following system diagram remains the target high-level integration architecture.
 
 <p align="center">
   <a href="https://raw.githubusercontent.com/AlbianSalihu/de1-soc-fpga-accelerated-video-pipeline/110baa942118c1e702a15baea3d05aff724acaef/docs/fpga_pipeline_overview.svg">
@@ -583,723 +1455,677 @@ interfaces, streaming CNN stages, external weight memory, and result path.
 </p>
 
 <p align="center">
-  <em>Click to open the full-size diagram.</em>
+  <em>Click the diagram to open the full-size SVG.</em>
 </p>
 
+The diagram is architectural planning material.
+
+Specific layer interfaces and memory adapters may change as the remaining blocks are
+implemented.
+
 ---
 
-### 5.2 Module Hierarchy
+# Step 6 — Verification status
 
+## 6.1 Directed convolution regression
+
+Run:
+
+```bash
+bash verification/sim/run_conv.sh
 ```
+
+The directed suite verifies:
+
+```text
+initial line filling
+prime-line filling
+weight filling
+concurrent activation and weight preparation
+first calculation
+horizontal sliding
+line rotation
+output backpressure
+multiple output groups
+frame completion
+automatic return to input-ready state
+automatic return to weight-ready state
+```
+
+---
+
+## 6.2 Traversal matrix
+
+Run:
+
+```bash
+bash verification/sim/run_conv_traversal.sh
+```
+
+The traversal matrix verifies combinations of:
+
+```text
+padding
+stride 2
+stride 3
+multiple output groups
+multiple input channels
+activation source gaps
+weight source gaps
+output backpressure
+trailing-row draining
+```
+
+Example verified cases include:
+
+```text
+padding_stride2_groups
+multichannel_with_source_gaps
+padding_stride3_groups
+trailing_row_drain
+combined_backpressure
+```
+
+---
+
+## 6.3 Requantization test
+
+The directed requantization test verifies:
+
+```text
+signed bias addition
+negative biased result clamped to zero
+ReLU
+shift equal to zero
+unsigned 32×32 multiplication
+64-bit intermediate product
+round-half-up
+logical right shift
+uint8 saturation
+different parameters per lane
+different parameters per output group
+raw output preservation
+quantized output stability under backpressure
+raw output stability under backpressure
+```
+
+Verified test result:
+
+```text
+PASS: bias, ReLU, requantization, rounding, saturation,
+channel selection and output backpressure are correct.
+```
+
+---
+
+## 6.4 Real-vector files
+
+For each convolution prefix, the real-vector test uses:
+
+```text
+<prefix>_in.bin
+<prefix>_weights.bin
+<prefix>_biases.bin
+<prefix>_requant_m.bin
+<prefix>_requant_r.bin
+<prefix>_out.bin
+```
+
+Example:
+
+```text
+features_0_in.bin
+features_0_weights.bin
+features_0_biases.bin
+features_0_requant_m.bin
+features_0_requant_r.bin
+features_0_out.bin
+```
+
+---
+
+## 6.5 Raw accumulator references
+
+The runner generates an additional reference file:
+
+```text
+verification/results/default/raw_acc/<prefix>_raw_acc.bin
+```
+
+This contains:
+
+```text
+Σ(input activation × signed weight)
+```
+
+before:
+
+```text
+bias
+ReLU
+requantization
+```
+
+The raw reference is generated in:
+
+```text
+output row
+    → output column
+        → output channel
+```
+
+order.
+
+The RTL stream is emitted in:
+
+```text
+output row
+    → output group
+        → output column
+            → lane
+```
+
+order.
+
+The testbench remaps the indices before comparison.
+
+---
+
+## 6.6 Real-vector comparisons
+
+For every output pixel and output channel:
+
+```text
+o_acc_data
+    is compared against
+    generated raw signed-int32 convolution output
+```
+
+and:
+
+```text
+o_data
+    is compared against
+    exported final uint8 model output
+```
+
+Therefore a passing real-vector test confirms both:
+
+```text
+window traversal, padding, stride, weights, and accumulation
+```
+
+and:
+
+```text
+bias, ReLU, rounding, requantization, and saturation
+```
+
+---
+
+## 6.7 Real-vector runner
+
+Run all convolution layers:
+
+```bash
+bash verification/sim/run_layers.sh
+```
+
+Regenerate raw accumulator references:
+
+```bash
+FORCE_GOLDEN=1 \
+bash verification/sim/run_layers.sh
+```
+
+Run one selected layer:
+
+```bash
+bash verification/sim/run_layers.sh features_0
+```
+
+Run with periodic output backpressure:
+
+```bash
+STALL_PERIOD=7 \
+bash verification/sim/run_layers.sh
+```
+
+Generate waveforms:
+
+```bash
+WAVE=1 \
+bash verification/sim/run_layers.sh features_0
+```
+
+---
+
+## 6.8 Current real-vector result
+
+```text
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Convolution real-vector results
+  Ran:    5 layers
+  Passed: 5 layers
+  Failed: 0 layers
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+The implemented convolution layer is currently bit-exact for all five model
+convolution stages.
+
+---
+
+## 6.9 Current convolution completion table
+
+| Feature | Status |
+|---|---|
+| Generic tensor dimensions | Complete |
+| Configurable kernel size | Complete |
+| Padding | Complete |
+| Horizontal stride | Complete |
+| Vertical stride | Complete |
+| Multiple input channels | Complete |
+| Multiple output groups | Complete |
+| Parallel output lanes | Complete |
+| Signed int8 weights | Complete |
+| Unsigned uint8 activations | Complete |
+| Signed int32 accumulation | Complete |
+| Per-channel bias | Complete |
+| ReLU | Complete |
+| Per-channel multiplier | Complete |
+| Per-channel shift | Complete |
+| Rounding | Complete |
+| Saturation | Complete |
+| Raw accumulator output | Complete |
+| Quantized packed output | Complete |
+| Output backpressure | Complete |
+| Output stability while stalled | Complete |
+| Trailing-input draining | Complete |
+| Frame-completion pulse | Complete |
+| Automatic restart | Complete |
+| Directed regression | Passing |
+| Traversal matrix | Passing |
+| Real-vector comparison | 5/5 passing |
+| Quartus synthesis | Not yet performed |
+| Quartus timing analysis | Not yet performed |
+
+---
+
+# Step 7 — Remaining implementation plan
+
+## 7.1 Current priority status
+
+The functional `conv_layer` milestone is complete.
+
+The next hardware stages are:
+
+```text
+maxpool_layer
+fc_layer
+weight-memory provider
+external SDRAM controller or adapter
+top-level streaming integration
+argmax/output stage
+Quartus implementation
+```
+
+---
+
+## 7.2 Remaining layer modules
+
+### `maxpool_layer`
+
+Planned role:
+
+```text
+2×2 maximum pooling
+stride 2
+uint8 input
+uint8 output
+ready/valid backpressure
+automatic frame completion
+```
+
+Expected internal storage:
+
+```text
+one input row
+plus current horizontal pair state
+```
+
+Verification should cover:
+
+```text
+all channels
+odd and even coordinates
+backpressure
+frame restart
+real exported pool vectors
+```
+
+---
+
+### `fc_layer`
+
+Planned role:
+
+```text
+uint8 activation input
+int8 weights
+int32 accumulation
+signed bias
+ReLU where required
+fixed-point requantization
+uint8 output for hidden FC layers
+raw final logits where required
+```
+
+Verification should use exported:
+
+```text
+input vectors
+weights
+biases
+requantization parameters
+final outputs
+```
+
+---
+
+## 7.3 Weight provider
+
+The current `conv_layer` exposes a weight-stream request interface.
+
+A future weight provider must:
+
+1. observe `o_weight_ready`;
+2. determine the requested output group;
+3. determine the requested input channel;
+4. provide `G_C_PAR × K × K` signed weight bytes;
+5. respect ready/valid transfer semantics;
+6. preserve ordering across stalls.
+
+Possible implementations:
+
+```text
+on-chip ROM
+on-chip RAM
+M10K-backed cache
+external SDRAM FIFO
+HPS DDR3 DMA
+Avalon-MM master
+```
+
+---
+
+## 7.4 Parameter provider
+
+Bias and requantization values are loaded through:
+
+```text
+cfg_we
+cfg_sel
+cfg_addr
+cfg_wdata
+```
+
+A future top-level controller must load:
+
+```text
+biases
+requantization multipliers
+requantization shifts
+```
+
+before enabling frame input.
+
+---
+
+## 7.5 Planned inter-layer adaptation
+
+The current convolution input is byte-wide:
+
+```text
+one uint8 activation per accepted transfer
+```
+
+The current convolution output is lane-packed:
+
+```text
+G_C_PAR uint8 values per accepted transfer
+```
+
+Connecting convolution layers directly therefore requires an adapter that converts:
+
+```text
+packed output lanes
+```
+
+into the next layer's expected input order:
+
+```text
+input row
+    → input column
+        → input channel
+```
+
+Possible implementation:
+
+```text
+lane serializer
+small FIFO
+channel-order adapter
+```
+
+This adapter must also preserve backpressure.
+
+---
+
+## 7.6 Top-level frame handling
+
+The convolution layer determines frame completion from its configured dimensions.
+
+It does not currently require:
+
+```text
+i_last
+o_last
+sop
+eop
+channel sideband
+external flush
+```
+
+The top-level pipeline should use:
+
+```text
+o_done
+```
+
+to coordinate completion and restart.
+
+Other layer types may use their own dimension counters and completion outputs.
+
+---
+
+## 7.7 Planned top-level hierarchy
+
+```text
 fpga_pipeline_top
 │
-├── conv_layer          [G_LAYER=1]   Conv1  1→64   5×5  BRAM weights  P=2
-│   ├── line_buffer                   4 rows × 64B
-│   ├── sliding_window                5×5×1  registers
-│   ├── mac_array                     2 parallel MACs
-│   ├── requant_unit                  (m,r) multiply+shift → uint8
-│   └── weight_bram                   1,856 B
+├── input stream adapter
 │
-├── maxpool_layer       [G_LAYER=1]   Pool1  64ch  64→32px
-│   └── row_buffer                    4,096 B
+├── conv_layer 1
+├── lane serializer / stream adapter
+├── maxpool_layer 1
 │
-├── conv_layer          [G_LAYER=2]   Conv2  64→192  3×3  BRAM weights  P=36
-│   ├── line_buffer                   2 rows × 4,096B
-│   ├── sliding_window                3×3×64  registers
-│   ├── mac_array                     36 parallel MACs
-│   ├── requant_unit
-│   └── weight_bram                   111,360 B
+├── conv_layer 2
+├── lane serializer / stream adapter
+├── maxpool_layer 2
 │
-├── maxpool_layer       [G_LAYER=2]   Pool2  192ch  32→16px
-│   └── row_buffer                    6,144 B
+├── conv_layer 3
+├── lane serializer / stream adapter
 │
-├── conv_layer          [G_LAYER=3]   Conv3  192→384  3×3  SDRAM weights  P=55
-│   ├── line_buffer                   2 rows × 6,144B
-│   ├── sliding_window                3×3×192  registers
-│   ├── mac_array                     55 parallel MACs
-│   ├── requant_unit
-│   └── weight_fifo                   1,728 B  ← fed by sdram_ctrl
+├── conv_layer 4
+├── lane serializer / stream adapter
 │
-├── conv_layer          [G_LAYER=4]   Conv4  384→256  3×3  SDRAM weights  P=73
-│   ├── line_buffer                   2 rows × 12,288B
-│   ├── sliding_window                3×3×384  registers
-│   ├── mac_array                     73 parallel MACs
-│   ├── requant_unit
-│   └── weight_fifo                   3,456 B
+├── conv_layer 5
+├── lane serializer / stream adapter
+├── maxpool_layer 3
 │
-├── conv_layer          [G_LAYER=5]   Conv5  256→256  3×3  SDRAM weights  P=48
-│   ├── line_buffer                   2 rows × 8,192B
-│   ├── sliding_window                3×3×256  registers
-│   ├── mac_array                     48 parallel MACs
-│   ├── requant_unit
-│   └── weight_fifo                   2,304 B
+├── activation buffer
+├── fc_layer 6
+├── fc_layer 7
+├── fc_layer 8
 │
-├── maxpool_layer       [G_LAYER=3]   Pool3  256ch  16→8px
-│   └── row_buffer                    4,096 B
+├── argmax unit
 │
-├── activation_buffer                 16,384 B  (flattened Pool3 → FC input)
-│
-├── fc_layer            [G_LAYER=6]   FC6  16384→1024  SDRAM weights  P=5
-│   ├── mac_array                     5 parallel MACs
-│   ├── requant_unit
-│   └── weight_fifo                   4,096 B
-│
-├── fc_layer            [G_LAYER=7]   FC7  1024→1024  SDRAM weights  P=5
-│   ├── mac_array                     5 parallel MACs
-│   ├── requant_unit
-│   └── weight_fifo                   1,024 B
-│
-├── fc_layer            [G_LAYER=8]   FC8  1024→10  BRAM weights  P=5
-│   ├── mac_array                     5 parallel MACs
-│   └── weight_bram                   10,280 B
-│
-├── argmax_unit                       finds winning class from 10 logits
-├── sdram_ctrl                        Avalon-MM master — streams weights to layer FIFOs
-└── pipeline_ctrl                     global flow control (sop/eop, stall, frame sync)
+├── weight-memory provider
+├── parameter-loading controller
+├── external-memory controller
+└── global completion/control logic
 ```
+
+This remains a target architecture and may be adjusted after synthesis and
+integration testing.
 
 ---
 
-### 5.3 Inter-Stage Streaming Interface (Avalon-ST)
+## 7.8 Proposed remaining RTL layout
 
-Every connection between pipeline stages uses the same streaming interface.
-Data flows as one uint8 activation per cycle, one channel at a time, in row-major order.
-The `channel` signal is carried alongside the data so downstream modules can route
-activations to the correct accumulator without maintaining an external counter.
-
-```
-pixel_stream:
-  valid   : std_logic                      -- data on bus is valid this cycle
-  ready   : std_logic                      -- downstream ready to accept (backpressure)
-  sop     : std_logic                      -- first activation of a new image
-  eop     : std_logic                      -- last activation of an image
-  channel : std_logic_vector(11 downto 0)  -- output channel index (0..C_out-1)
-  data    : std_logic_vector( 7 downto 0)  -- uint8 activation value
-```
-
-**Flow rule:** a stage must not assert `valid` until its line buffer is fully populated
-(all K×K×C_in values present). At startup and at image boundaries, the line buffer
-asserts `window_valid` internally to gate the MAC array.
-
----
-
-### 5.4 Layer Generics
-
-**conv_layer**
-```vhdl
-entity conv_layer is
-  generic (
-    G_C_IN      : positive;           -- input channels
-    G_C_OUT     : positive;           -- output channels
-    G_H_IN      : positive;           -- input height (pixels)
-    G_W_IN      : positive;           -- input width  (pixels)
-    G_KERNEL    : positive := 3;      -- kernel size (3 or 5)
-    G_PADDING   : natural  := 1;      -- zero-padding each side
-    G_PAR_MACS  : positive;           -- parallel MAC units
-    G_WEIGHT_SRC: string   := "BRAM"  -- "BRAM" or "SDRAM"
-  );
-```
-
-**maxpool_layer**
-```vhdl
-entity maxpool_layer is
-  generic (
-    G_CHANNELS  : positive;
-    G_W_IN      : positive;
-    G_H_IN      : positive;
-    G_POOL_SIZE : positive := 2;
-    G_STRIDE    : positive := 2
-  );
-```
-
-**fc_layer**
-```vhdl
-entity fc_layer is
-  generic (
-    G_C_IN      : positive;
-    G_C_OUT     : positive;
-    G_PAR_MACS  : positive;
-    G_WEIGHT_SRC: string := "SDRAM"
-  );
-```
-
----
-
-### 5.5 Sub-Module Interfaces
-
-**line_buffer**
-```
-Inputs:  clk, rst_n, din (uint8), wr_en, col_idx
-Outputs: window_out [K×K×C_in] of uint8,  window_valid
-```
-
-**mac_array**
-```
-Inputs:  clk, rst_n, window [K×K×C_in] of uint8,
-         weights [P][K×K×C_in] of int8, bias [P] of int32, start, weight_sel
-Outputs: acc_out [P] of int32,  acc_valid
-```
-
-**requant_unit** — integer-only: `q_out = clip(((acc × m) >> r), 0, 255)`
-```
-Inputs:  acc (int32), m (uint32), r (uint8)
-Outputs: q_out (uint8)
-```
-
-**sdram_ctrl** — Avalon-MM master; feeds all layer weight FIFOs from external SDRAM
-```
-Inputs:  clk, rst_n, req_layer, req_addr, req_len
-Outputs: avmm_addr/read/rddata/rdvalid/waitreq,  fifo_data, fifo_wr_en, fifo_full
-```
-
----
-
-### 5.6 Top-Level Port Map
-
-```
-Inputs:
-  clk_100     : std_logic              -- 100 MHz system clock
-  rst_n       : std_logic              -- active-low reset
-
-  -- pixel stream (from HPS or camera interface)
-  pix_valid, pix_sop, pix_eop : std_logic
-  pix_data    : std_logic_vector(7 downto 0)   -- uint8 grayscale
-
-  -- SDRAM chip (IS42S16320F, 16-bit bus)
-  sdram_dq    : std_logic_vector(15 downto 0)
-  sdram_addr  : std_logic_vector(12 downto 0)
-  sdram_ba    : std_logic_vector(1 downto 0)
-  sdram_cas_n, sdram_ras_n, sdram_we_n, sdram_cs_n, sdram_clk, sdram_cke : std_logic
-  sdram_dqm   : std_logic_vector(1 downto 0)
-
-Outputs:
-  result_valid : std_logic
-  result_class : std_logic_vector(3 downto 0)   -- class index 0..9
-  result_conf  : std_logic_vector(7 downto 0)   -- raw logit of winning class
-```
-
----
-
-### 5.7 Planned RTL File Layout
-
-```
+```text
 hardware/rtl/
 ├── top/
 │   └── fpga_pipeline_top.vhd
+│
 ├── layers/
 │   ├── conv_layer.vhd
 │   ├── maxpool_layer.vhd
 │   └── fc_layer.vhd
-├── primitives/
-│   ├── line_buffer.vhd
-│   ├── mac_array.vhd
-│   ├── requant_unit.vhd
-│   ├── weight_bram.vhd
-│   ├── weight_fifo.vhd
-│   └── argmax_unit.vhd
+│
+├── stream/
+│   ├── lane_serializer.vhd
+│   ├── stream_fifo.vhd
+│   └── tensor_order_adapter.vhd
+│
 ├── memory/
+│   ├── weight_provider.vhd
+│   ├── weight_fifo.vhd
 │   └── sdram_ctrl.vhd
-└── control/
-    └── pipeline_ctrl.vhd
+│
+├── control/
+│   ├── parameter_loader.vhd
+│   └── pipeline_ctrl.vhd
+│
+└── output/
+    └── argmax_unit.vhd
+```
+
+Only files that actually exist should be presented as implemented.
+
+The rest should remain labeled as planned.
+
+---
+
+## 7.9 Quartus validation plan
+
+When convolution synthesis work resumes:
+
+1. create a synthesis wrapper for one representative layer;
+2. synthesize Conv1;
+3. synthesize a large multi-channel 3×3 layer;
+4. inspect multiplier inference;
+5. inspect DSP packing;
+6. inspect line-buffer memory inference;
+7. inspect parameter-memory inference;
+8. inspect ALM and register usage;
+9. run TimeQuest;
+10. record achieved Fmax;
+11. compare actual results with the planning estimates.
+
+Required report fields:
+
+```text
+ALMs
+registers
+M10K blocks
+MLAB usage
+DSP blocks
+total block memory bits
+critical path
+setup slack
+achieved Fmax
 ```
 
 ---
 
-### 5.8 V1/V2 Modularity Strategy
+## 7.10 Integration verification plan
 
-The architecture is designed so that v2 improvements — HPS offload, dynamic weight loading,
-master control — require **wiring changes at the top level only**. No layer module is
-ever rewritten between versions.
+Future integration tests should include:
 
-This is achieved by separating two independent concerns inside each layer:
-
-#### Data plane vs control plane
-
-**Data plane** — always on FPGA, unchanged between versions:
-- Activations stream between layers via Avalon-ST (valid/ready/data)
-- Each layer has one streaming input and one streaming output
-- The MAC array, line buffer, and requant unit are purely data-driven
-
-**Control plane** — evolves between versions:
-- V1: no master; weights initialised from `.mif` files at power-on; port B tied off
-- V2: a master (HPS ARM or FPGA state machine) writes weights at runtime via port B
-
-#### Dual-port BRAM weight storage (internal implementation detail)
-
-Weights are **internal** to each layer — nothing crosses the layer boundary for weights
-in V1. The layer is a black box with only data in and data out:
-
-```
-         ┌─────────────────────────────────────┐
-         │              conv_layer              │
-         │                                     │
-data ────►  in                           out ──►  data
-         │                                     │
-         │   ┌─────────────┐                  │
-         │   │ weight BRAM │                  │
-         │   │  port A ────┼──► MAC array     │
-         │   │  port B     │  (tied off, V1)  │
-         │   └─────────────┘                  │
-         │   line buffer, sliding window, ...  │
-         └─────────────────────────────────────┘
-```
-
-Inside the BRAM, port A is read every cycle by the MAC array. Port B exists physically
-but is tied off in V1 — no ports are exposed on the layer boundary.
-
-In V2, port B gets wired up: it becomes actual input ports on the layer module,
-connected to a master via Avalon-MM. That change is local to the layer's port list
-and the top-level wiring — the internal MAC array and compute logic are untouched.
-
-#### V2 address map
-
-When port B is exposed in V2, each layer is assigned a fixed base address on the
-Avalon-MM bus. The master routes weight writes by address — no layer ID signal needed.
-
-| Layer | Base address | Weight size |
-|-------|-------------|-------------|
-| Conv1 | 0x0000_0000 | 2 KB |
-| Conv2 | 0x0000_1000 | 112 KB |
-| Conv3–5 | SDRAM-mapped | — |
-| FC8 | 0x0002_0000 | 11 KB |
-
-#### Interface width and parallelism
-
-The Avalon-ST data bus between layers carries **one uint8 activation per cycle**.
-Internal parallelism is controlled by the `G_PAR_MACS` generic — it sets how many
-MAC units run simultaneously inside a layer, completely independent of the external
-interface width.
-
-- The inter-layer interface stays narrow and simple (8-bit)
-- Each layer scales its internal compute independently via `G_PAR_MACS`
-- Increasing parallelism in one layer never affects any other layer's interface
-
----
-
-## Step 6 — Implementation Plan & Build Order
-
-The implementation follows a strict **bottom-up, simulation-first** discipline:
-every primitive is written and verified in isolation before being composed into a layer,
-and every layer passes its testbench before being connected to the top-level.
-Nothing advances to the next phase until the current phase has zero failures.
-
----
-
-### 6.1 Test Vector Strategy
-
-The Python quantized model (`ml/src/export/test_quantized_model.py`) already executes
-full integer inference with access to every intermediate tensor. Before any VHDL is
-written, it is extended to dump golden test vectors for each module:
-
-```
-ml/outputs/runN/test_vectors/
-├── input_image.bin          -- 64×64 uint8 pixel values
-├── conv1_weights.bin        -- int8 weights + int32 biases
-├── conv1_in.bin             -- uint8 activations entering Conv1
-├── conv1_out.bin            -- uint8 activations leaving Conv1 (post-requant)
-├── conv1_acc_sample.bin     -- int32 accumulators for a known pixel position
-├── ...                      -- same pattern for conv2..5, pool1..3, fc6..8
-└── final_class.txt          -- expected argmax output
-```
-
-Every VHDL testbench reads these files as stimulus and compares output bit-for-bit
-against the golden values. A mismatch is a **hard failure**, not a warning.
-This directly ties hardware verification to the Python reference model and makes any
-numerical discrepancy immediately traceable to a specific layer and operation.
-
----
-
-### 6.2 Simulation Toolchain
-
-| Tool | Role |
-|------|------|
-| **GHDL** | Open-source VHDL simulator — fast compile, scriptable, no licence required |
-| **GTKWave** | Waveform viewer for GHDL output |
-| **ModelSim** (Quartus Lite) | Waveform debugging for complex timing issues |
-| **Quartus Prime Lite** | Synthesis, place-and-route, resource and timing reports |
-| **Python** | Test vector generation and result comparison scripts |
-
-Quartus is only opened for resource reports and final bitstream generation.
-All functional verification happens in simulation first.
-
----
-
-### 6.3 Phase 1 — Primitives
-
-The six primitives have no inter-dependencies and can be developed in parallel.
-
-| # | Module | Test criteria |
-|---|--------|--------------|
-| 1 | `requant_unit` | Known (acc, m, r) triples from Python → correct uint8 output. Saturation at 0 and 255. |
-| 2 | `mac_array` | Conv1 weights + known 5×5×1 window → int32 accumulator matches Python exactly. All-zero input check. |
-| 3 | `line_buffer` | Full 64-wide row streamed in → correct 5×5 window at the right cycle. First and last pixel boundary cases. |
-| 4 | `weight_bram` | Write known weights, read back. Verify 1-cycle M10K read latency. |
-| 5 | `weight_fifo` | Fill to capacity → `full` flag asserts. Drain → `empty` flag asserts. Simultaneous read/write. |
-| 6 | `argmax_unit` | All 10 FC8 logits → correct class index. Tie-breaking behaviour. |
-
-**Exit criterion:** all six testbenches pass with zero mismatches against Python vectors.
-
----
-
-### 6.4 Phase 2 — Memory Controller
-
-| # | Module | Test criteria |
-|---|--------|--------------|
-| 7 | `sdram_ctrl` | Behavioural SDRAM model (IS42S16320F). Burst read of Conv3 weight block fills `weight_fifo` correctly. SDRAM refresh cycles do not corrupt in-flight data. |
-
-The SDRAM controller is the most complex individual module — it must handle burst
-timing, CAS latency, refresh arbitration, and FIFO backpressure simultaneously.
-Extra debug time should be budgeted here.
-
-**Exit criterion:** 1,728 bytes of Conv3 weights read from simulated SDRAM,
-deposited into `weight_fifo`, verified byte-for-byte against the Python export file.
-
----
-
-### 6.5 Phase 3 — Layers
-
-Layers are built in increasing complexity, using progressively wider generics.
-
-| # | Module | Configuration | Key challenge |
-|---|--------|--------------|--------------|
-| 8 | `conv_layer` | Conv1 — BRAM, P=2, 5×5 | First integration: line_buffer + mac_array + requant. Validate pipeline timing end-to-end. |
-| 9 | `maxpool_layer` | Pool1 — 64ch, 64→32px | Row-buffer timing: row N must be held until row N+1 arrives. |
-| 10 | `conv_layer` | Conv2 — BRAM, P=36, 3×3 | 36 parallel accumulators must stay synchronised through the full image. |
-| 11 | `maxpool_layer` | Pool2 — 192ch | Same as Pool1 at wider channel count. |
-| 12 | `conv_layer` | Conv3 — SDRAM, P=55, 3×3 | First SDRAM-fed layer. sdram_ctrl + weight_fifo enter the critical path. |
-| 13 | `conv_layer` | Conv4, Conv5 | Same pattern as Conv3, different generics. |
-| 14 | `maxpool_layer` | Pool3 — 256ch | |
-| 15 | `fc_layer` | FC6, FC7 — SDRAM | No sliding window. Verify sequential neuron accumulation against Python. |
-| 16 | `fc_layer` | FC8 — BRAM | Final logits feed argmax_unit. |
-
-**Exit criterion per layer:** complete output tensor matches Python golden file
-for all spatial positions and channels of one full test image.
-
----
-
-### 6.6 Phase 4 — Integration & On-Board Verification
-
-| # | Task | Success criteria |
-|---|------|-----------------|
-| 17 | Assemble `fpga_pipeline_top` | Compiles cleanly, no unconnected ports, no bus-width mismatches |
-| 18 | End-to-end simulation — 1 image | `result_class` matches Python argmax |
-| 19 | End-to-end simulation — 10 images | All 10 match; no state leakage between frames (tests sop/eop flush logic) |
-| 20 | Quartus synthesis | DSP, M10K, ALM counts within pre-calculated budgets |
-| 21 | Quartus place-and-route | All timing paths close at 100 MHz (Fmax ≥ 100 MHz) |
-| 22 | On-board test | Correct class for 10 known MNIST images, on hardware, verified via UART or LED display |
-
----
-
-### 6.7 Dependency Graph
-
-```
-requant_unit  ──────────────────────────────────────────┐
-mac_array     ──────────────────────────────────────────┤
-line_buffer   ──────────────────────────────────────────┼──► conv_layer (BRAM)  ──┐
-weight_bram   ──────────────────────────────────────────┘                         │
-                                                                                  │
-weight_fifo   ──────┐                                                             │
-sdram_ctrl    ──────┴───────────────────────────────────── conv_layer (SDRAM) ──┤
-                                                                                  │
-maxpool_layer (row_buffer only) ─────────────────────────────────────────────────┤
-fc_layer      ───────────────────────────────────────────────────────────────────┤
-argmax_unit   ───────────────────────────────────────────────────────────────────┤
-activation_buffer ───────────────────────────────────────────────────────────────┤
-pipeline_ctrl ───────────────────────────────────────────────────────────────────┤
-                                                                                  ▼
-                                                                    fpga_pipeline_top
+```text
+two consecutive complete images
+different images without reset
+backpressure between every pair of stages
+weight-source stalls
+parameter loading before frame start
+frame completion from every stage
+no stale data between frames
+end-to-end comparison against Python
 ```
 
 ---
 
-### 6.8 Risk Register
+## 7.11 Risk register
 
 | Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|-----------|
-| SDRAM timing closure at 100 MHz | Medium | High | Pipeline register at SDRAM output; fall back to 80 MHz target if needed |
-| Conv4 sliding window (27,648 FFs) causes place-and-route congestion | Low | Medium | Split into two sub-stages sharing the window; or store half the window in BRAM with a 2-cycle accumulate schedule |
-| SDRAM refresh stall exceeds weight FIFO depth, causing MAC pipeline to starve | Medium | Medium | Size FIFOs to absorb worst-case refresh duration (≤ 7.8 µs = 780 cycles at 100 MHz) |
-| requant intermediate (acc × m) overflows int64 before the right-shift | Low | High | Pre-verified in Python before export; overflow assertion added to testbench |
-| Frame-to-frame state leak through unflushed line buffers | Medium | High | Explicit flush FSM triggered on eop; testbench always runs ≥ 2 consecutive images |
+|---|---|---|---|
+| Multipliers do not pack into the expected DSP mode | Medium | High | Inspect Quartus DSP inference and adjust operand widths |
+| Line buffer maps poorly to M10K | Medium | Medium | Reshape memory, add inference attributes, or use explicit RAM blocks |
+| Wide packed output causes routing pressure | Medium | Medium | Add output register stage or reduce `G_C_PAR` |
+| Requantization path limits Fmax | Medium | Medium | Pipeline 32×32 multiplication and shift |
+| External memory starves weight loading | Medium | High | Add prefetching and double-buffered FIFOs |
+| Layer adapters become throughput bottlenecks | Medium | High | Size FIFOs and serialize at a sustainable rate |
+| Frame state leaks between images | Low | High | Maintain restart regressions and add two-frame end-to-end tests |
+| Planning resource estimates differ from synthesis | High | Medium | Treat Quartus reports as authoritative |
 
 ---
 
-## Step 7 — What to Build
+# Summary
 
-This section is the definitive build list. Every module is listed with its role,
-its ports, and its internal structure. Updated as decisions are made during implementation.
+The project has moved beyond the architectural-draft stage.
 
----
+The current verified milestone is a generic quantized convolution layer with:
 
-### Streaming interface (used everywhere between layers)
-
-Every connection between pipeline stages uses the same four signals:
-
-```
-valid  : std_logic                     -- producer: data on bus is valid this cycle
-ready  : std_logic                     -- consumer: I can accept data this cycle
-data   : std_logic_vector(7 downto 0)  -- uint8 activation value
-last   : std_logic                     -- last activation of this frame (end of image)
-```
-
-Data transfers only when `valid = 1` AND `ready = 1` simultaneously.
-`last` marks the final byte of a frame so downstream modules know when to flush.
-
----
-
-### 7.1 Primitives
-
-These are standalone building blocks with no dependencies on other custom modules.
-
----
-
-#### `requant_unit`
-Converts one int32 accumulator to one uint8 activation using fixed-point multiply + shift.
-
-```
-Inputs:
-  i_acc : signed(31 downto 0)    -- post-ReLU accumulator (>= 0)
-  i_m   : unsigned(31 downto 0)  -- per-channel multiplier
-  i_r   : unsigned(5 downto 0)   -- right-shift amount (0-63)
-
-Output:
-  o_q   : unsigned(7 downto 0)   -- requantised uint8
-
-Formula:  o_q = clip( round( (acc x m) >> r ), 0, 255 )
-Rounding: (acc x m + 2^(r-1)) >> r   (round-to-nearest, matches Python exactly)
-Combinational — no clock.
+```text
+streamed uint8 activations
+streamed int8 weights
+int32 accumulation
+per-channel bias
+ReLU
+fixed-point requantization
+uint8 saturation
+padding
+stride
+multi-channel accumulation
+multiple output groups
+backpressure
+completion
+automatic restart
 ```
 
----
+All five real convolution layers pass bit-exact comparison against the exported model
+vectors.
 
-#### `line_buffer`
-Holds K-1 complete rows so the conv layer can form its K×K sliding window.
-One pixel arrives per cycle. When enough rows are buffered, the sliding window
-is valid and MACs can fire.
+The remaining work is primarily:
 
-```
-Inputs:
-  clk    : std_logic
-  rst_n  : std_logic
-  i_data : std_logic_vector(7 downto 0)  -- one pixel per cycle
-  i_valid: std_logic
-
-Outputs:
-  o_window : array [K][K] of std_logic_vector(7 downto 0)  -- K×K pixel neighbourhood
-  o_valid  : std_logic                                      -- window is populated and ready
-
-Internals:
-  K-1 BRAM line buffers (one full row each, W pixels wide)
-  K shift registers (5 pixels wide for 5×5, 3 for 3×3) — one per row tap
-  Window is valid after K-1 full rows have been received
-```
-
----
-
-#### `mac_array`
-Performs G_PAR_MACS parallel multiply-accumulate operations each cycle.
-One call per sliding window position computes G_PAR_MACS partial output channels.
-
-```
-Inputs:
-  clk      : std_logic
-  rst_n    : std_logic
-  i_window : array [K*K*C_IN] of signed(7 downto 0)   -- flattened pixel window (int8)
-  i_weights: array [G_PAR_MACS][K*K*C_IN] of signed(7 downto 0)  -- int8 weights
-  i_bias   : array [G_PAR_MACS] of signed(31 downto 0) -- int32 biases
-  i_valid  : std_logic                                  -- window is valid, fire MACs
-  i_last   : std_logic                                  -- last window of this output channel
-
-Outputs:
-  o_acc    : array [G_PAR_MACS] of signed(31 downto 0) -- int32 accumulators
-  o_valid  : std_logic                                  -- accumulators ready
-
-Generics:
-  G_PAR_MACS : positive   -- number of parallel MAC units
-  G_K        : positive   -- kernel size (3 or 5)
-  G_C_IN     : positive   -- input channels
-```
-
----
-
-#### `weight_bram`
-Dual-port BRAM storing int8 weights and int32 biases for one layer.
-Port A feeds the MAC array. Port B is unused in V1 (tied off), available for
-runtime weight updates in V2.
-
-```
-Inputs:
-  clk      : std_logic
-  i_addr_a : unsigned   -- read address (from MAC array sequencer)
-
-Output:
-  o_data_a : std_logic_vector(7 downto 0)  -- int8 weight value, 1-cycle latency
-
-Generics:
-  G_DEPTH  : positive   -- number of weight entries
-  G_WIDTH  : positive   -- 8 for weights, 32 for biases
-Initialised from .mif file at synthesis time.
-```
-
----
-
-#### `weight_fifo`
-Small BRAM FIFO that absorbs burst latency from the SDRAM controller.
-The MAC array reads from one side; sdram_ctrl writes to the other.
-
-```
-Inputs:
-  clk      : std_logic
-  -- write side (from sdram_ctrl)
-  i_wr_data: std_logic_vector(7 downto 0)
-  i_wr_en  : std_logic
-  -- read side (from MAC array)
-  i_rd_en  : std_logic
-
-Outputs:
-  o_rd_data: std_logic_vector(7 downto 0)
-  o_full   : std_logic
-  o_empty  : std_logic
-
-Generics:
-  G_DEPTH  : positive   -- sized to absorb worst-case SDRAM refresh (780 cycles)
-```
-
----
-
-#### `argmax_unit`
-Scans the 10 int32 logits from FC8 and outputs the index of the largest value.
-
-```
-Inputs:
-  clk      : std_logic
-  i_data   : signed(31 downto 0)   -- one logit per cycle, streamed in
-  i_valid  : std_logic
-  i_last   : std_logic             -- last of the 10 logits
-
-Outputs:
-  o_class  : unsigned(3 downto 0)  -- winning class (0-9)
-  o_valid  : std_logic             -- result ready
-```
-
----
-
-### 7.2 Layers
-
-Layers compose the primitives above. Each layer has exactly:
-- One streaming input  (`i_valid`, `i_ready`, `i_data`, `i_last`)
-- One streaming output (`o_valid`, `o_ready`, `o_data`, `o_last`)
-- Nothing else on the boundary in V1
-
----
-
-#### `conv_layer`
-Generic convolution: line buffer → sliding window → MAC array → ReLU → requant → stream out.
-
-```
-Generics:
-  G_C_IN      : positive           -- input channels
-  G_C_OUT     : positive           -- output channels
-  G_H_IN      : positive           -- input height
-  G_W_IN      : positive           -- input width
-  G_KERNEL    : positive := 3      -- kernel size (3 or 5)
-  G_PADDING   : natural  := 1      -- zero-padding each side
-  G_PAR_MACS  : positive           -- parallel MAC units
-  G_WEIGHT_SRC: string   := "BRAM" -- "BRAM" or "SDRAM"
-
-Internals:
-  line_buffer    -- holds K-1 rows, taps sliding window
-  mac_array      -- G_PAR_MACS parallel MACs, fires when window valid
-  requant_unit   -- one instance per parallel MAC output
-  weight_bram    -- if G_WEIGHT_SRC = "BRAM"
-  weight_fifo    -- if G_WEIGHT_SRC = "SDRAM"
-```
-
----
-
-#### `maxpool_layer`
-Generic 2×2 max pooling with stride 2. Buffers one row, compares with the next.
-
-```
-Generics:
-  G_CHANNELS : positive
-  G_W_IN     : positive
-  G_H_IN     : positive
-
-Internals:
-  row_buffer  -- holds one full input row (W x C bytes) while waiting for the next row
-  comparator  -- pixel-wise max across two rows and two columns
-```
-
----
-
-#### `fc_layer`
-Generic fully connected layer. No sliding window — accumulates over all C_IN inputs
-sequentially then requantizes.
-
-```
-Generics:
-  G_C_IN      : positive
-  G_C_OUT     : positive
-  G_PAR_MACS  : positive
-  G_WEIGHT_SRC: string := "SDRAM"
-  G_LAST      : boolean := false   -- true for FC8 (no requant, raw int32 out)
-
-Internals:
-  mac_array      -- G_PAR_MACS parallel MACs
-  requant_unit   -- skipped if G_LAST = true
-  weight_bram or weight_fifo
-```
-
----
-
-### 7.3 Memory & Control
-
-#### `sdram_ctrl`
-Streams weight data from external SDRAM into each layer's `weight_fifo`.
-One layer's weights at a time, in order, cycling through SDRAM-mapped layers.
-
-```
-Inputs:
-  clk, rst_n
-  i_fifo_full : std_logic   -- backpressure from the target layer's fifo
-
-Outputs:
-  -- SDRAM chip pins (IS42S16320F)
-  o_sdram_addr, o_sdram_ba, o_sdram_cas_n, o_sdram_ras_n, ...
-  -- data out to weight_fifo
-  o_fifo_data  : std_logic_vector(7 downto 0)
-  o_fifo_wr_en : std_logic
-```
-
----
-
-#### `fpga_pipeline_top`
-Wires all layers together in order. No logic of its own — purely structural.
-
-```
-Inputs:
-  clk_100, rst_n
-  i_valid, i_data, i_last   -- pixel stream in
-
-Outputs:
-  o_class : unsigned(3 downto 0)  -- predicted class
-  o_valid : std_logic             -- result valid
-  -- SDRAM pins passed through to sdram_ctrl
-```
-
----
-
-#### `pipeline_ctrl`
-Generates `i_last` and manages frame boundaries. Counts pixels, asserts `last`
-on the final pixel of each frame, flushes line buffers between frames.
-
-```
-Inputs:
-  clk, rst_n
-  i_valid : std_logic
-
-Outputs:
-  o_last  : std_logic   -- asserted on final pixel of each frame
-  o_flush : std_logic   -- tells line buffers to clear state
+```text
+other layer implementations
+stream adaptation
+weight and parameter infrastructure
+top-level integration
+Quartus resource validation
+timing closure
+on-board verification
 ```

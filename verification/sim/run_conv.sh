@@ -76,5 +76,21 @@ run_testbench \
     "verification/tb/conv/tb_conv_layer_calculation.vhd" \
     "tb_conv_layer_calculation"
 
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_horizontal_sliding.vhd" \
+    "tb_conv_layer_horizontal_sliding"
+
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_line_rotation.vhd" \
+    "tb_conv_layer_line_rotation"
+
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_output_backpressure.vhd" \
+    "tb_conv_layer_output_backpressure"
+
+run_testbench \
+    "verification/tb/conv/tb_conv_layer_output_groups.vhd" \
+    "tb_conv_layer_output_groups"
+
 echo
 echo "All convolution testbenches passed."

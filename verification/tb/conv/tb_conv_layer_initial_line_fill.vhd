@@ -16,7 +16,9 @@ architecture sim of tb_conv_layer_initial_line_fill is
 
     constant C_C_IN   : positive := 1;
     constant C_W_IN   : positive := 4;
+    
     constant C_KERNEL : positive := 3;
+    constant C_H_IN : positive := C_KERNEL;
 
     constant C_INITIAL_FILL_SIZE : positive :=
         (C_KERNEL - 1) * C_W_IN * C_C_IN;
@@ -35,10 +37,14 @@ begin
 
     dut : entity work.conv_layer
         generic map (
-            G_C_IN   => C_C_IN,
-            G_W_IN   => C_W_IN,
-            G_C_PAR  => 2,
-            G_KERNEL => C_KERNEL
+            G_C_IN    => C_C_IN,
+            G_C_OUT   => 2,
+            G_W_IN    => C_W_IN,
+            G_H_IN    => C_H_IN,
+            G_C_PAR   => 2,
+            G_KERNEL  => C_KERNEL,
+            G_PADDING => 0,
+            G_STRIDE  => 1
         )
         port map (
             clk            => clk,
@@ -52,7 +58,8 @@ begin
             o_weight_ready => open,
             i_weight_data  => (others => '0'),
             o_acc_valid => open,
-            o_acc_data  => open
+            o_acc_data  => open,
+            i_acc_ready => '1'
         );
 
 

@@ -1,16 +1,17 @@
 library ieee;
 use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
 
 library std;
 use std.env.all;
 
 use work.conv_tb_pkg.all;
 
-entity tb_conv_layer_prime_weight_concurrent is
-end entity tb_conv_layer_prime_weight_concurrent;
+entity tb_conv_layer_horizontal_sliding is
+end entity tb_conv_layer_horizontal_sliding;
 
 
-architecture sim of tb_conv_layer_prime_weight_concurrent is
+architecture sim of tb_conv_layer_horizontal_sliding is
 
     constant C_CLK_PERIOD : time := 10 ns;
 
@@ -19,19 +20,29 @@ architecture sim of tb_conv_layer_prime_weight_concurrent is
     constant C_C_PAR  : positive := 2;
     constant C_KERNEL : positive := 3;
     constant C_H_IN  : positive := C_KERNEL;
-    
+
+    constant C_LINE_SIZE : positive :=
+        C_W_IN * C_C_IN;
 
     constant C_INITIAL_FILL_SIZE : positive :=
-        (C_KERNEL - 1) * C_W_IN * C_C_IN;
+        (C_KERNEL - 1) * C_LINE_SIZE;
 
     constant C_PRIME_FILL_SIZE : positive :=
         C_KERNEL * C_C_IN;
 
+    constant C_STREAM_FILL_SIZE : positive :=
+        (C_W_IN - C_KERNEL) * C_C_IN;
+
     constant C_TOTAL_ACTIVATIONS : positive :=
-        C_INITIAL_FILL_SIZE + C_PRIME_FILL_SIZE;
+        C_INITIAL_FILL_SIZE +
+        C_PRIME_FILL_SIZE +
+        C_STREAM_FILL_SIZE;
+
+    constant C_KERNEL_SIZE : positive :=
+        C_KERNEL * C_KERNEL;
 
     constant C_WEIGHT_FILL_SIZE : positive :=
-        C_C_PAR * C_KERNEL * C_KERNEL;
+        C_C_PAR * C_KERNEL_SIZE;
 
     signal clk   : std_logic := '0';
     signal rst_n : std_logic := '0';
@@ -46,12 +57,11 @@ architecture sim of tb_conv_layer_prime_weight_concurrent is
     signal i_weight_data  : std_logic_vector(7 downto 0) :=
         (others => '0');
 
-    signal activation_done : std_logic := '0';
-    signal weight_done     : std_logic := '0';
+    signal o_acc_valid : std_logic;
+    signal o_acc_data  :
+        std_logic_vector(C_C_PAR * 32 - 1 downto 0);
 
-    signal activation_accept_count : natural := 0;
-    signal weight_accept_count     : natural := 0;
-    signal prime_overlap_count     : natural := 0;
+    signal acc_valid_count : natural := 0;
 
 begin
 
@@ -80,8 +90,9 @@ begin
             i_weight_valid => i_weight_valid,
             o_weight_ready => o_weight_ready,
             i_weight_data  => i_weight_data,
-            o_acc_valid => open,
-            o_acc_data  => open,
+
+            o_acc_valid    => o_acc_valid,
+            o_acc_data     => o_acc_data,
             i_acc_ready => '1'
         );
 
@@ -114,8 +125,6 @@ begin
             p_count       => C_TOTAL_ACTIVATIONS
         );
 
-        activation_done <= '1';
-
         wait;
     end process;
 
@@ -124,55 +133,38 @@ begin
     begin
         wait until rst_n = '1';
 
-        send_weight_range(
-            p_clk          => clk,
-            p_weight_valid => i_weight_valid,
-            p_weight_ready => o_weight_ready,
-            p_weight_data  => i_weight_data,
-            p_first_value  => 0,
-            p_count        => C_WEIGHT_FILL_SIZE
-        );
+        for index in 0 to C_KERNEL_SIZE - 1 loop
+            send_weight_byte(
+                p_clk          => clk,
+                p_weight_valid => i_weight_valid,
+                p_weight_ready => o_weight_ready,
+                p_weight_data  => i_weight_data,
+                p_value        => 1
+            );
+        end loop;
 
-        weight_done <= '1';
+        for index in 0 to C_KERNEL_SIZE - 1 loop
+            send_weight_byte(
+                p_clk          => clk,
+                p_weight_valid => i_weight_valid,
+                p_weight_ready => o_weight_ready,
+                p_weight_data  => i_weight_data,
+                p_value        => 255
+            );
+        end loop;
 
         wait;
     end process;
 
 
-    monitor_process : process(clk)
+    result_counter_process : process(clk)
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
-                activation_accept_count <= 0;
-                weight_accept_count     <= 0;
-                prime_overlap_count     <= 0;
+                acc_valid_count <= 0;
 
-            else
-                if i_valid = '1' and i_ready = '1' then
-
-                    if activation_accept_count >=
-                       C_INITIAL_FILL_SIZE and
-                       activation_accept_count <
-                       C_TOTAL_ACTIVATIONS then
-
-                        if i_weight_valid = '1' and
-                           o_weight_ready = '1' then
-
-                            prime_overlap_count <=
-                                prime_overlap_count + 1;
-                        end if;
-                    end if;
-
-                    activation_accept_count <=
-                        activation_accept_count + 1;
-                end if;
-
-                if i_weight_valid = '1' and
-                   o_weight_ready = '1' then
-
-                    weight_accept_count <=
-                        weight_accept_count + 1;
-                end if;
+            elsif o_acc_valid = '1' then
+                acc_valid_count <= acc_valid_count + 1;
             end if;
         end if;
     end process;
@@ -180,41 +172,56 @@ begin
 
     result_process : process
     begin
-        wait until activation_done = '1' and
-                   weight_done = '1';
-
+        wait until o_acc_valid = '1';
         wait for 1 ns;
 
-        assert activation_accept_count =
-               C_TOTAL_ACTIVATIONS
+        assert signed(o_acc_data(31 downto 0)) =
+               to_signed(45, 32)
             report
-                "FAIL: incorrect activation transfer count."
+                "FAIL: window 0 lane 0 was not 45."
             severity failure;
 
-        assert weight_accept_count =
-               C_WEIGHT_FILL_SIZE
+        assert signed(o_acc_data(63 downto 32)) =
+               to_signed(-45, 32)
             report
-                "FAIL: incorrect weight transfer count."
+                "FAIL: window 0 lane 1 was not -45."
             severity failure;
 
-        assert prime_overlap_count =
-               C_PRIME_FILL_SIZE
+        wait until o_acc_valid = '0';
+        wait until o_acc_valid = '1';
+        wait for 1 ns;
+
+        assert signed(o_acc_data(31 downto 0)) =
+               to_signed(54, 32)
             report
-                "FAIL: prime-K-line filling and weight filling did not run concurrently."
+                "FAIL: window 1 lane 0 was not 54."
+            severity failure;
+
+        assert signed(o_acc_data(63 downto 32)) =
+               to_signed(-54, 32)
+            report
+                "FAIL: window 1 lane 1 was not -54."
+            severity failure;
+
+        wait until o_acc_valid = '0';
+
+        wait until rising_edge(clk);
+        wait until rising_edge(clk);
+        wait until rising_edge(clk);
+        wait for 1 ns;
+
+        assert acc_valid_count = 2
+            report
+                "FAIL: calculation did not produce exactly two results."
             severity failure;
 
         assert i_ready = '0'
             report
-                "FAIL: activation input remained ready after prime filling."
-            severity failure;
-
-        assert o_weight_ready = '0'
-            report
-                "FAIL: weight input remained ready after weight filling."
+                "FAIL: activation input remained ready after row completion."
             severity failure;
 
         report
-            "PASS: all three prime-K activation transfers overlapped with weight transfers."
+            "PASS: horizontal sliding produced windows 45/-45 and 54/-54."
             severity note;
 
         stop;
@@ -224,11 +231,11 @@ begin
 
     timeout_process : process
     begin
-        wait for 1 us;
+        wait for 2 us;
 
         assert false
             report
-                "FAIL: concurrent prime/weight test timed out."
+                "FAIL: horizontal sliding test timed out."
             severity failure;
     end process;
 

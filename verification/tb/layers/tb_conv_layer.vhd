@@ -1,312 +1,841 @@
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+
+library std;
 use std.env.all;
+
 
 entity tb_conv_layer is
     generic (
-        G_PREFIX   : string   := "features_0";
-        G_C_IN     : positive := 1;
-        G_C_OUT    : positive := 64;
-        G_H_IN     : positive := 64;
-        G_W_IN     : positive := 64;
-        G_KERNEL   : positive := 5;
-        G_PADDING  : natural  := 2;
-        G_PAR_MACS : positive := 2;
-        G_VECS     : string   := "verification/vectors/default/";
-        G_RESS     : string   := "verification/results/default/";
-        G_PROGRESS_STEP : natural := 10
+        G_PREFIX          : string   := "features_0";
+
+        G_C_IN            : positive := 1;
+        G_C_OUT           : positive := 64;
+        G_H_IN            : positive := 64;
+        G_W_IN            : positive := 64;
+        G_KERNEL          : positive := 5;
+        G_C_PAR           : positive := 2;
+
+        -- Selects which group of G_C_PAR output channels is tested.
+        G_OUT_GROUP       : natural  := 0;
+
+        G_VECS            : string :=
+            "verification/vectors/default/";
+
+        G_GOLDEN_FILE     : string :=
+            "verification/results/default/raw_acc/" &
+            "features_0_raw_acc.bin";
+
+        G_RESULT_FILE     : string :=
+            "verification/results/default/" &
+            "features_0_group_0_received_acc.bin";
+
+        -- 0 means output is always ready.
+        -- Values >= 2 stall one cycle every G_STALL_PERIOD cycles.
+        G_STALL_PERIOD    : natural := 7;
+
+        G_PROGRESS_STEP   : natural := 10;
+
+        G_TIMEOUT_CYCLES  : positive := 20_000_000
     );
 end entity tb_conv_layer;
 
+
 architecture sim of tb_conv_layer is
 
-    -- Derived sizes used for loading and output counting
-    constant C_W_DEPTH  : positive :=
-        G_C_OUT / G_PAR_MACS * G_KERNEL * G_KERNEL * G_C_IN;
-    constant C_N_IN     : positive := G_H_IN * G_W_IN * G_C_IN;
-    constant C_N_OUT    : positive := G_H_IN * G_W_IN * G_C_OUT;
+    constant C_CLK_PERIOD : time := 10 ns;
 
-    -- Vector file paths (relative to project root where sim is invoked)
-    constant C_VECS : string := G_VECS;
-    constant C_RESS : string := G_RESS;
+    constant C_KERNEL_SIZE : positive :=
+        G_KERNEL * G_KERNEL;
 
-    -- Clock / reset
+    constant C_H_OUT : positive :=
+        G_H_IN - G_KERNEL + 1;
+
+    constant C_W_OUT : positive :=
+        G_W_IN - G_KERNEL + 1;
+
+    constant C_INPUT_COUNT : positive :=
+        G_H_IN * G_W_IN * G_C_IN;
+
+    constant C_OUTPUT_WINDOW_COUNT : positive :=
+        C_H_OUT * C_W_OUT;
+
+    constant C_WEIGHT_GROUP_SIZE : positive :=
+        G_C_PAR * C_KERNEL_SIZE;
+
+    constant C_SELECTED_WEIGHT_COUNT : positive :=
+        G_C_IN * C_WEIGHT_GROUP_SIZE;
+
+    constant C_GROUP_FIRST_CHANNEL : natural :=
+        G_OUT_GROUP * G_C_PAR;
+
+    constant C_GROUP_LAST_CHANNEL : natural :=
+        C_GROUP_FIRST_CHANNEL + G_C_PAR - 1;
+
+
+    function expected_weight_group_count return positive is
+    begin
+        if G_C_IN = 1 then
+            -- For a single input channel, the DUT loads one group and
+            -- reuses it for every spatial window.
+            return 1;
+        else
+            -- For multiple input channels, every spatial window needs
+            -- one streamed weight group per input channel.
+            return C_OUTPUT_WINDOW_COUNT * G_C_IN;
+        end if;
+    end function;
+
+
+    constant C_EXPECTED_WEIGHT_GROUP_COUNT : positive :=
+        expected_weight_group_count;
+
+    constant C_EXPECTED_WEIGHT_TRANSFER_COUNT : positive :=
+        C_EXPECTED_WEIGHT_GROUP_COUNT * C_WEIGHT_GROUP_SIZE;
+
+
+    type t_binary_file is file of character;
+
+    type t_selected_weight_memory is array (
+        0 to C_SELECTED_WEIGHT_COUNT - 1
+    ) of std_logic_vector(7 downto 0);
+
+
     signal clk   : std_logic := '0';
     signal rst_n : std_logic := '0';
 
-    -- Streaming interface
     signal i_valid : std_logic := '0';
     signal i_ready : std_logic;
-    signal i_data  : std_logic_vector(7 downto 0) := (others => '0');
-    signal i_last  : std_logic := '0';
-    signal o_valid : std_logic;
-    signal o_ready : std_logic := '1';
-    signal o_data  : std_logic_vector(7 downto 0);
-    signal o_last  : std_logic;
+    signal i_data  : std_logic_vector(7 downto 0) :=
+        (others => '0');
 
-    -- Config port
-    signal cfg_we    : std_logic                     := '0';
-    signal cfg_sel   : std_logic_vector(1 downto 0)  := (others => '0');
-    signal cfg_addr  : std_logic_vector(19 downto 0) := (others => '0');
-    signal cfg_wdata : std_logic_vector(31 downto 0) := (others => '0');
+    signal i_weight_valid : std_logic := '0';
+    signal o_weight_ready : std_logic;
+    signal i_weight_data  : std_logic_vector(7 downto 0) :=
+        (others => '0');
+
+    signal i_acc_ready : std_logic := '0';
+    signal o_acc_valid : std_logic;
+    signal o_acc_data  :
+        std_logic_vector(G_C_PAR * 32 - 1 downto 0);
+
+    signal activation_accept_count : natural := 0;
+    signal weight_accept_count     : natural := 0;
+    signal output_accept_count     : natural := 0;
 
 begin
 
-    clk <= not clk after 5 ns;  -- 100 MHz
+    clk <= not clk after C_CLK_PERIOD / 2;
+
+
+    configuration_check_process : process
+    begin
+        assert G_KERNEL > 1
+            report
+                "tb_conv_layer requires G_KERNEL > 1."
+            severity failure;
+
+        assert G_W_IN > G_KERNEL
+            report
+                "The current conv_layer requires G_W_IN > G_KERNEL."
+            severity failure;
+
+        assert G_H_IN >= G_KERNEL
+            report
+                "The current conv_layer requires G_H_IN >= G_KERNEL."
+            severity failure;
+
+        assert G_C_OUT mod G_C_PAR = 0
+            report
+                "G_C_OUT must be divisible by G_C_PAR."
+            severity failure;
+
+        assert C_GROUP_LAST_CHANNEL < G_C_OUT
+            report
+                "G_OUT_GROUP selects output channels outside G_C_OUT."
+            severity failure;
+
+        assert G_STALL_PERIOD = 0 or G_STALL_PERIOD >= 2
+            report
+                "G_STALL_PERIOD must be 0 or at least 2."
+            severity failure;
+
+        wait;
+    end process;
+
 
     dut : entity work.conv_layer
         generic map (
-            G_C_IN     => G_C_IN,
-            G_C_OUT    => G_C_OUT,
-            G_H_IN     => G_H_IN,
-            G_W_IN     => G_W_IN,
-            G_KERNEL   => G_KERNEL,
-            G_PADDING  => G_PADDING,
-            G_PAR_MACS => G_PAR_MACS
+            G_C_IN    => G_C_IN,
+            G_C_OUT   => G_C_PAR,
+            G_W_IN    => G_W_IN,
+            G_H_IN    => G_H_IN,
+            G_C_PAR   => G_C_PAR,
+            G_KERNEL  => G_KERNEL,
+            G_PADDING => 0,
+            G_STRIDE  => 1
         )
         port map (
-            clk      => clk,
-            rst_n    => rst_n,
-            i_valid  => i_valid,
-            i_ready  => i_ready,
-            i_data   => i_data,
-            i_last   => i_last,
-            o_valid  => o_valid,
-            o_ready  => o_ready,
-            o_data   => o_data,
-            o_last   => o_last,
-            cfg_we   => cfg_we,
-            cfg_sel  => cfg_sel,
-            cfg_addr => cfg_addr,
-            cfg_wdata=> cfg_wdata
+            clk            => clk,
+            rst_n          => rst_n,
+
+            i_valid        => i_valid,
+            i_ready        => i_ready,
+            i_data         => i_data,
+
+            i_weight_valid => i_weight_valid,
+            o_weight_ready => o_weight_ready,
+            i_weight_data  => i_weight_data,
+
+            i_acc_ready    => i_acc_ready,
+            o_acc_valid    => o_acc_valid,
+            o_acc_data     => o_acc_data
         );
 
-    -- ---------------------------------------------------------------
-    -- p_load: read parameter binaries and write through cfg port
-    --         runs before rst_n is released
-    -- ---------------------------------------------------------------
-    p_load : process
-        type bin_file is file of character;
-        file     f       : bin_file;
-        variable ch      : character;
-        variable b0, b1, b2, b3 : integer;
-        variable v_slv   : std_logic_vector(31 downto 0);
-        variable v_byte  : integer;
-        variable v_addr  : integer;
 
-        procedure cfg_write (
-            sel  : in std_logic_vector(1 downto 0);
-            addr : in integer;
-            data : in std_logic_vector(31 downto 0)) is
-        begin
-            cfg_sel   <= sel;
-            cfg_addr  <= std_logic_vector(to_unsigned(addr, 20));
-            cfg_wdata <= data;
-            cfg_we    <= '1';
-            wait until rising_edge(clk);
-            cfg_we    <= '0';
-        end procedure;
-
+    reset_process : process
     begin
-        report "START " & G_PREFIX &
-               "  Cin=" & integer'image(G_C_IN) &
-               "  Cout=" & integer'image(G_C_OUT) &
-               "  HxW=" & integer'image(G_H_IN) & "x" & integer'image(G_W_IN) &
-               "  K=" & integer'image(G_KERNEL) &
-               "  P=" & integer'image(G_PADDING) &
-               "  PAR=" & integer'image(G_PAR_MACS);
+        rst_n <= '0';
 
-        -- weights: PyTorch order C_out x C_in x KH x KW
-        --   -> DUT flat addr = (c_out/PAR_MACS)*K*K*C_IN + kh*K*C_IN + kw*C_IN + c_in
-        --     bank = c_out mod PAR_MACS
-        --     flat cfg_addr = bank * C_W_DEPTH + position
-        file_open(f, C_VECS & G_PREFIX & "_weights.bin", read_mode);
-        for c_out in 0 to G_C_OUT - 1 loop
-            for c_in in 0 to G_C_IN - 1 loop
-                for kh in 0 to G_KERNEL - 1 loop
-                    for kw in 0 to G_KERNEL - 1 loop
-                        read(f, ch);
-                        v_byte := character'pos(ch);
-                        -- sign-extend uint8 -> int8
-                        if v_byte >= 128 then v_byte := v_byte - 256; end if;
-                        v_addr :=
-                            (c_out mod G_PAR_MACS) * C_W_DEPTH +
-                            (c_out / G_PAR_MACS) * G_KERNEL * G_KERNEL * G_C_IN +
-                            kh * G_KERNEL * G_C_IN +
-                            kw * G_C_IN + c_in;
-                        v_slv := std_logic_vector(to_signed(v_byte, 32));
-                        cfg_write("00", v_addr, v_slv);
-                    end loop;
-                end loop;
-            end loop;
-        end loop;
-        file_close(f);
-
-        -- biases: int32 little-endian, one per output channel
-        file_open(f, C_VECS & G_PREFIX & "_biases.bin", read_mode);
-        for c_out in 0 to G_C_OUT - 1 loop
-            read(f, ch); b0 := character'pos(ch);
-            read(f, ch); b1 := character'pos(ch);
-            read(f, ch); b2 := character'pos(ch);
-            read(f, ch); b3 := character'pos(ch);
-            v_slv(7  downto  0) := std_logic_vector(to_unsigned(b0, 8));
-            v_slv(15 downto  8) := std_logic_vector(to_unsigned(b1, 8));
-            v_slv(23 downto 16) := std_logic_vector(to_unsigned(b2, 8));
-            v_slv(31 downto 24) := std_logic_vector(to_unsigned(b3, 8));
-            cfg_write("01", c_out, v_slv);
-        end loop;
-        file_close(f);
-
-        -- rq_m: uint32 little-endian
-        file_open(f, C_VECS & G_PREFIX & "_requant_m.bin", read_mode);
-        for c_out in 0 to G_C_OUT - 1 loop
-            read(f, ch); b0 := character'pos(ch);
-            read(f, ch); b1 := character'pos(ch);
-            read(f, ch); b2 := character'pos(ch);
-            read(f, ch); b3 := character'pos(ch);
-            v_slv(7  downto  0) := std_logic_vector(to_unsigned(b0, 8));
-            v_slv(15 downto  8) := std_logic_vector(to_unsigned(b1, 8));
-            v_slv(23 downto 16) := std_logic_vector(to_unsigned(b2, 8));
-            v_slv(31 downto 24) := std_logic_vector(to_unsigned(b3, 8));
-            cfg_write("10", c_out, v_slv);
-        end loop;
-        file_close(f);
-
-        -- rq_r: uint8, one per output channel
-        file_open(f, C_VECS & G_PREFIX & "_requant_r.bin", read_mode);
-        for c_out in 0 to G_C_OUT - 1 loop
-            read(f, ch);
-            v_slv := std_logic_vector(to_unsigned(character'pos(ch), 32));
-            cfg_write("11", c_out, v_slv);
-        end loop;
-        file_close(f);
-
-        -- release reset after all parameters are loaded
         wait until rising_edge(clk);
+        wait until rising_edge(clk);
+        wait until rising_edge(clk);
+        wait until falling_edge(clk);
+
         rst_n <= '1';
+
         wait;
-    end process p_load;
+    end process;
 
-    -- ---------------------------------------------------------------
-    -- p_stim: stream layer input into the DUT byte by byte
-    -- ---------------------------------------------------------------
-    p_stim : process
-        type bin_file is file of character;
-        file     f_in   : bin_file;
-        variable ch     : character;
-        variable n_sent : integer := 0;
+
+    --------------------------------------------------------------------
+    -- Read the existing layer input vector and stream it into the DUT.
+    --
+    -- Existing input ordering:
+    --   row -> column -> input channel
+    --------------------------------------------------------------------
+    activation_driver_process : process
+        file f_input : t_binary_file;
+
+        variable v_char : character;
     begin
-        -- wait for reset release (driven by p_load)
+        i_valid <= '0';
+        i_data  <= (others => '0');
+
         wait until rst_n = '1';
-        wait until rising_edge(clk);
 
-        file_open(f_in, C_VECS & G_PREFIX & "_in.bin", read_mode);
+        file_open(
+            f_input,
+            G_VECS & G_PREFIX & "_in.bin",
+            read_mode
+        );
 
-        while not endfile(f_in) loop
-            read(f_in, ch);
-            n_sent := n_sent + 1;
+        for input_index in 0 to C_INPUT_COUNT - 1 loop
 
-            i_data  <= std_logic_vector(to_unsigned(character'pos(ch), 8));
+            assert not endfile(f_input)
+                report
+                    G_PREFIX &
+                    ": input vector ended before byte " &
+                    integer'image(input_index)
+                severity failure;
+
+            read(f_input, v_char);
+
+            wait until falling_edge(clk);
+
+            i_data <= std_logic_vector(
+                to_unsigned(character'pos(v_char), 8)
+            );
+
             i_valid <= '1';
-            if n_sent = C_N_IN then
-                i_last <= '1';
-            end if;
 
-            -- wait until the transfer is accepted
             loop
                 wait until rising_edge(clk);
                 exit when i_ready = '1';
             end loop;
         end loop;
 
-        i_valid <= '0';
-        i_last  <= '0';
-        file_close(f_in);
-        wait;
-    end process p_stim;
+        wait until falling_edge(clk);
 
-    -- ---------------------------------------------------------------
-    -- p_capture: collect output, compare byte-exact against expected
-    -- ---------------------------------------------------------------
-    p_capture : process
-        type bin_file is file of character;
-        file     f_exp  : bin_file;
-        file     f_res  : bin_file;
-        variable ch_exp : character;
-        variable got    : integer;
-        variable exp    : integer;
-        variable n_recv : integer := 0;
-        variable pct    : integer;
-        variable next_pct : integer := G_PROGRESS_STEP;
-        variable pixel  : integer;
-        variable row    : integer;
-        variable col    : integer;
-        variable ch     : integer;
+        i_valid <= '0';
+        i_data  <= (others => '0');
+
+        assert endfile(f_input)
+            report
+                G_PREFIX &
+                ": input vector contains more than " &
+                integer'image(C_INPUT_COUNT) &
+                " bytes."
+            severity failure;
+
+        file_close(f_input);
+
+        wait;
+    end process;
+
+
+    --------------------------------------------------------------------
+    -- Load the selected output-channel group from the existing PyTorch
+    -- weight vector, then replay the requested input-channel slice
+    -- whenever the DUT raises o_weight_ready.
+    --
+    -- Existing file ordering:
+    --   output channel -> input channel -> kernel row -> kernel column
+    --
+    -- DUT group ordering:
+    --   lane 0 KxK -> lane 1 KxK -> ... -> lane G_C_PAR-1 KxK
+    --------------------------------------------------------------------
+    weight_driver_process : process
+        file f_weights : t_binary_file;
+
+        variable v_weights : t_selected_weight_memory;
+
+        variable v_char       : character;
+        variable v_lane       : natural;
+        variable v_store_addr : natural;
+
+        variable v_channel  : natural range 0 to G_C_IN - 1 := 0;
+        variable v_position :
+            natural range 0 to C_WEIGHT_GROUP_SIZE - 1 := 0;
+
+        variable v_drive_addr : natural;
+    begin
+        i_weight_valid <= '0';
+        i_weight_data  <= (others => '0');
+
+        file_open(
+            f_weights,
+            G_VECS & G_PREFIX & "_weights.bin",
+            read_mode
+        );
+
+        for output_channel in 0 to G_C_OUT - 1 loop
+            for input_channel in 0 to G_C_IN - 1 loop
+                for kernel_row in 0 to G_KERNEL - 1 loop
+                    for kernel_column in 0 to G_KERNEL - 1 loop
+
+                        assert not endfile(f_weights)
+                            report
+                                G_PREFIX &
+                                ": weight vector ended unexpectedly."
+                            severity failure;
+
+                        read(f_weights, v_char);
+
+                        if output_channel >=
+                           C_GROUP_FIRST_CHANNEL and
+                           output_channel <=
+                           C_GROUP_LAST_CHANNEL then
+
+                            v_lane :=
+                                output_channel -
+                                C_GROUP_FIRST_CHANNEL;
+
+                            v_store_addr :=
+                                input_channel *
+                                    C_WEIGHT_GROUP_SIZE +
+                                v_lane *
+                                    C_KERNEL_SIZE +
+                                kernel_row *
+                                    G_KERNEL +
+                                kernel_column;
+
+                            v_weights(v_store_addr) :=
+                                std_logic_vector(
+                                    to_unsigned(
+                                        character'pos(v_char),
+                                        8
+                                    )
+                                );
+                        end if;
+
+                    end loop;
+                end loop;
+            end loop;
+        end loop;
+
+        assert endfile(f_weights)
+            report
+                G_PREFIX &
+                ": weight vector contains additional bytes."
+            severity failure;
+
+        file_close(f_weights);
+
+        wait until rst_n = '1';
+
+        loop
+            wait until falling_edge(clk);
+
+            if o_weight_ready = '1' then
+                v_drive_addr :=
+                    v_channel *
+                        C_WEIGHT_GROUP_SIZE +
+                    v_position;
+
+                i_weight_data <=
+                    v_weights(v_drive_addr);
+
+                i_weight_valid <= '1';
+            else
+                i_weight_valid <= '0';
+            end if;
+
+            wait until rising_edge(clk);
+
+            if i_weight_valid = '1' and
+               o_weight_ready = '1' then
+
+                if v_position =
+                   C_WEIGHT_GROUP_SIZE - 1 then
+
+                    v_position := 0;
+
+                    if v_channel = G_C_IN - 1 then
+                        v_channel := 0;
+                    else
+                        v_channel := v_channel + 1;
+                    end if;
+
+                else
+                    v_position := v_position + 1;
+                end if;
+            end if;
+        end loop;
+    end process;
+
+
+    --------------------------------------------------------------------
+    -- Periodic output backpressure.
+    --------------------------------------------------------------------
+    output_ready_process : process
+        variable v_cycle : natural := 0;
+    begin
+        i_acc_ready <= '0';
+
+        wait until rst_n = '1';
+
+        loop
+            wait until falling_edge(clk);
+
+            if G_STALL_PERIOD = 0 then
+                i_acc_ready <= '1';
+            else
+                if v_cycle mod G_STALL_PERIOD =
+                   G_STALL_PERIOD - 1 then
+
+                    i_acc_ready <= '0';
+                else
+                    i_acc_ready <= '1';
+                end if;
+
+                v_cycle := v_cycle + 1;
+            end if;
+        end loop;
+    end process;
+
+
+    --------------------------------------------------------------------
+    -- Count accepted transfers.
+    --------------------------------------------------------------------
+    transfer_monitor_process : process(clk)
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                activation_accept_count <= 0;
+                weight_accept_count     <= 0;
+                output_accept_count     <= 0;
+
+            else
+                if i_valid = '1' and
+                   i_ready = '1' then
+
+                    activation_accept_count <=
+                        activation_accept_count + 1;
+                end if;
+
+                if i_weight_valid = '1' and
+                   o_weight_ready = '1' then
+
+                    weight_accept_count <=
+                        weight_accept_count + 1;
+                end if;
+
+                if o_acc_valid = '1' and
+                   i_acc_ready = '1' then
+
+                    output_accept_count <=
+                        output_accept_count + 1;
+                end if;
+            end if;
+        end if;
+    end process;
+
+
+    --------------------------------------------------------------------
+    -- Verify that valid and data remain stable under backpressure.
+    --------------------------------------------------------------------
+    output_stability_process : process(clk)
+        variable v_was_stalled : boolean := false;
+
+        variable v_held_data :
+            std_logic_vector(G_C_PAR * 32 - 1 downto 0) :=
+            (others => '0');
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                v_was_stalled := false;
+                v_held_data   := (others => '0');
+
+            else
+                if v_was_stalled then
+                    assert o_acc_valid = '1'
+                        report
+                            G_PREFIX &
+                            ": o_acc_valid cleared while stalled."
+                        severity failure;
+
+                    assert o_acc_data = v_held_data
+                        report
+                            G_PREFIX &
+                            ": o_acc_data changed while stalled."
+                        severity failure;
+                end if;
+
+                if o_acc_valid = '1' and
+                   i_acc_ready = '0' then
+
+                    v_was_stalled := true;
+                    v_held_data   := o_acc_data;
+                else
+                    v_was_stalled := false;
+                end if;
+            end if;
+        end if;
+    end process;
+
+
+    --------------------------------------------------------------------
+    -- Compare each accepted packed accumulator against the full raw
+    -- golden file.
+    --
+    -- Golden file ordering:
+    --   output row -> output column -> output channel
+    --
+    -- Each value is signed int32 little-endian.
+    --------------------------------------------------------------------
+    output_capture_process : process
+        file f_expected : t_binary_file;
+        file f_result   : t_binary_file;
+
+        variable v_char : character;
+
+        variable v_expected_bits :
+            std_logic_vector(31 downto 0);
+
+        variable v_expected : signed(31 downto 0);
+        variable v_got      : signed(31 downto 0);
+
+        variable v_lane     : natural;
+        variable v_received : natural := 0;
+
+        variable v_row      : natural;
+        variable v_column   : natural;
+
+        variable v_percent      : natural;
+        variable v_next_percent : natural := G_PROGRESS_STEP;
+
+
+        procedure read_i32_le (
+            file p_file : t_binary_file;
+            variable p_value : out signed(31 downto 0)
+        ) is
+            variable v_byte_char : character;
+
+            variable v_bits :
+                std_logic_vector(31 downto 0);
+        begin
+            for byte_index in 0 to 3 loop
+                assert not endfile(p_file)
+                    report
+                        G_PREFIX &
+                        ": raw accumulator golden file ended " &
+                        "unexpectedly."
+                    severity failure;
+
+                read(p_file, v_byte_char);
+
+                v_bits(
+                    (byte_index + 1) * 8 - 1
+                    downto
+                    byte_index * 8
+                ) :=
+                    std_logic_vector(
+                        to_unsigned(
+                            character'pos(v_byte_char),
+                            8
+                        )
+                    );
+            end loop;
+
+            p_value := signed(v_bits);
+        end procedure;
+
+
+        procedure write_i32_le (
+            file p_file : t_binary_file;
+            constant p_value : in signed(31 downto 0)
+        ) is
+            variable v_bits :
+                std_logic_vector(31 downto 0);
+        begin
+            v_bits := std_logic_vector(p_value);
+
+            for byte_index in 0 to 3 loop
+                write(
+                    p_file,
+                    character'val(
+                        to_integer(
+                            unsigned(
+                                v_bits(
+                                    (byte_index + 1) * 8 - 1
+                                    downto
+                                    byte_index * 8
+                                )
+                            )
+                        )
+                    )
+                );
+            end loop;
+        end procedure;
+
     begin
         wait until rst_n = '1';
 
-        file_open(f_exp, C_VECS & G_PREFIX & "_out.bin", read_mode);
-        file_open(f_res, C_RESS & G_PREFIX & "_conv_layer_out.bin", write_mode);
+        file_open(
+            f_expected,
+            G_GOLDEN_FILE,
+            read_mode
+        );
 
-        while n_recv < C_N_OUT loop
+        file_open(
+            f_result,
+            G_RESULT_FILE,
+            write_mode
+        );
+
+        report
+            "START " & G_PREFIX &
+            " group=" & integer'image(G_OUT_GROUP) &
+            " channels=" &
+            integer'image(C_GROUP_FIRST_CHANNEL) &
+            ".." &
+            integer'image(C_GROUP_LAST_CHANNEL) &
+            " Cin=" & integer'image(G_C_IN) &
+            " Cout=" & integer'image(G_C_OUT) &
+            " HxW=" &
+            integer'image(G_H_IN) &
+            "x" &
+            integer'image(G_W_IN) &
+            " K=" & integer'image(G_KERNEL) &
+            " Cpar=" & integer'image(G_C_PAR);
+
+        while v_received < C_OUTPUT_WINDOW_COUNT loop
             wait until rising_edge(clk);
-            if o_valid = '1' and o_ready = '1' then
-                read(f_exp, ch_exp);
-                got := to_integer(unsigned(o_data));
-                exp := character'pos(ch_exp);
 
-                write(f_res, character'val(got));
+            if o_acc_valid = '1' and
+               i_acc_ready = '1' then
 
-                pixel := n_recv / G_C_OUT;
-                row   := pixel / G_W_IN;
-                col   := pixel mod G_W_IN;
-                ch    := n_recv mod G_C_OUT;
-                pct   := (n_recv * 100) / C_N_OUT;
+                v_row :=
+                    v_received / C_W_OUT;
 
-                assert got = exp
-                    report G_PREFIX & " MISMATCH at byte " & integer'image(n_recv) &
-                           "  row="      & integer'image(row) &
-                           "  col="      & integer'image(col) &
-                           "  ch="       & integer'image(ch) &
-                           "  pct="      & integer'image(pct) & "%" &
-                           "  expected=" & integer'image(exp) &
-                           "  got="      & integer'image(got)
-                    severity failure;
+                v_column :=
+                    v_received mod C_W_OUT;
 
-                n_recv := n_recv + 1;
+                -- The golden file contains every output channel.
+                -- Read one complete output pixel, comparing only the
+                -- output channels selected by this simulation.
+                for output_channel in 0 to G_C_OUT - 1 loop
+
+                    read_i32_le(
+                        f_expected,
+                        v_expected
+                    );
+
+                    if output_channel >=
+                       C_GROUP_FIRST_CHANNEL and
+                       output_channel <=
+                       C_GROUP_LAST_CHANNEL then
+
+                        v_lane :=
+                            output_channel -
+                            C_GROUP_FIRST_CHANNEL;
+
+                        v_got :=
+                            signed(
+                                o_acc_data(
+                                    (v_lane + 1) * 32 - 1
+                                    downto
+                                    v_lane * 32
+                                )
+                            );
+
+                        write_i32_le(
+                            f_result,
+                            v_got
+                        );
+
+                        assert v_got = v_expected
+                            report
+                                G_PREFIX &
+                                " mismatch:" &
+                                " group=" &
+                                integer'image(G_OUT_GROUP) &
+                                " row=" &
+                                integer'image(v_row) &
+                                " col=" &
+                                integer'image(v_column) &
+                                " output_channel=" &
+                                integer'image(output_channel) &
+                                " expected=" &
+                                integer'image(
+                                    to_integer(v_expected)
+                                ) &
+                                " got=" &
+                                integer'image(
+                                    to_integer(v_got)
+                                )
+                            severity failure;
+                    end if;
+                end loop;
+
+                v_received := v_received + 1;
 
                 if G_PROGRESS_STEP > 0 then
-                    pct := (n_recv * 100) / C_N_OUT;
-                    if pct >= next_pct and n_recv < C_N_OUT then
-                        report "PROGRESS " & G_PREFIX & " " &
-                               integer'image(pct) & "%  " &
-                               integer'image(n_recv) & "/" &
-                               integer'image(C_N_OUT) & " bytes";
+                    v_percent :=
+                        (v_received * 100) /
+                        C_OUTPUT_WINDOW_COUNT;
 
-                        while next_pct <= pct loop
-                            next_pct := next_pct + G_PROGRESS_STEP;
+                    if v_percent >= v_next_percent and
+                       v_received <
+                       C_OUTPUT_WINDOW_COUNT then
+
+                        report
+                            "PROGRESS " &
+                            G_PREFIX &
+                            " group=" &
+                            integer'image(G_OUT_GROUP) &
+                            " " &
+                            integer'image(v_percent) &
+                            "% " &
+                            integer'image(v_received) &
+                            "/" &
+                            integer'image(
+                                C_OUTPUT_WINDOW_COUNT
+                            ) &
+                            " windows";
+
+                        while v_next_percent <=
+                              v_percent loop
+
+                            v_next_percent :=
+                                v_next_percent +
+                                G_PROGRESS_STEP;
                         end loop;
                     end if;
                 end if;
             end if;
         end loop;
 
-        file_close(f_exp);
-        file_close(f_res);
+        assert endfile(f_expected)
+            report
+                G_PREFIX &
+                ": raw accumulator golden file contains " &
+                "additional values."
+            severity failure;
 
-        report "PASS " & G_PREFIX & " - all " & integer'image(C_N_OUT) &
-               " output bytes match";
+        file_close(f_expected);
+        file_close(f_result);
+
+        -- Allow the final handshake and controller transition to settle.
+        for cycle in 1 to 10 loop
+            wait until rising_edge(clk);
+        end loop;
+
+        assert activation_accept_count =
+               C_INPUT_COUNT
+            report
+                G_PREFIX &
+                ": expected " &
+                integer'image(C_INPUT_COUNT) &
+                " accepted activations, got " &
+                integer'image(
+                    activation_accept_count
+                )
+            severity failure;
+
+        assert weight_accept_count =
+               C_EXPECTED_WEIGHT_TRANSFER_COUNT
+            report
+                G_PREFIX &
+                ": expected " &
+                integer'image(
+                    C_EXPECTED_WEIGHT_TRANSFER_COUNT
+                ) &
+                " accepted weights, got " &
+                integer'image(weight_accept_count)
+            severity failure;
+
+        assert output_accept_count =
+               C_OUTPUT_WINDOW_COUNT
+            report
+                G_PREFIX &
+                ": expected " &
+                integer'image(
+                    C_OUTPUT_WINDOW_COUNT
+                ) &
+                " accepted output windows, got " &
+                integer'image(output_accept_count)
+            severity failure;
+
+        assert o_acc_valid = '0'
+            report
+                G_PREFIX &
+                ": unexpected accumulator remained pending."
+            severity failure;
+
+        report
+            "PASS " &
+            G_PREFIX &
+            " group=" &
+            integer'image(G_OUT_GROUP) &
+            " channels=" &
+            integer'image(C_GROUP_FIRST_CHANNEL) &
+            ".." &
+            integer'image(C_GROUP_LAST_CHANNEL) &
+            " windows=" &
+            integer'image(C_OUTPUT_WINDOW_COUNT)
+            severity note;
+
         stop(0);
-    end process p_capture;
+        wait;
+    end process;
 
-    -- ---------------------------------------------------------------
-    -- Timeout watchdog - fails if simulation hangs
-    -- ---------------------------------------------------------------
-    p_watchdog : process
+
+    watchdog_process : process
     begin
-        wait for 100 ms;
-        assert false report "TIMEOUT" severity failure;
-    end process p_watchdog;
+        for cycle in 1 to G_TIMEOUT_CYCLES loop
+            wait until rising_edge(clk);
+        end loop;
+
+        assert false
+            report
+                "TIMEOUT " &
+                G_PREFIX &
+                " group=" &
+                integer'image(G_OUT_GROUP)
+            severity failure;
+    end process;
 
 end architecture sim;

@@ -18,6 +18,7 @@ architecture sim of tb_conv_layer_weight_filling is
     constant C_W_IN   : positive := 4;
     constant C_C_PAR  : positive := 2;
     constant C_KERNEL : positive := 3;
+    constant C_H_IN  : positive := C_KERNEL;
 
     constant C_WEIGHT_FILL_SIZE : positive :=
         C_C_PAR * C_KERNEL * C_KERNEL;
@@ -41,10 +42,14 @@ begin
 
     dut : entity work.conv_layer
         generic map (
-            G_C_IN   => C_C_IN,
-            G_W_IN   => C_W_IN,
-            G_C_PAR  => C_C_PAR,
-            G_KERNEL => C_KERNEL
+            G_C_IN    => C_C_IN,
+            G_C_OUT   => C_C_PAR,
+            G_W_IN    => C_W_IN,
+            G_H_IN    => C_H_IN,
+            G_C_PAR   => C_C_PAR,
+            G_KERNEL  => C_KERNEL,
+            G_PADDING => 0,
+            G_STRIDE  => 1
         )
         port map (
             clk            => clk,
@@ -58,7 +63,8 @@ begin
             o_weight_ready => o_weight_ready,
             i_weight_data  => i_weight_data,
             o_acc_valid => open,
-            o_acc_data  => open
+            o_acc_data  => open,
+            i_acc_ready => '1'
         );
 
 

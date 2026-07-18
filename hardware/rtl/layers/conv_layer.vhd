@@ -5,9 +5,13 @@ use ieee.numeric_std.all;
 entity conv_layer is
     generic (
         G_C_IN : positive;
+        G_C_OUT : positive;
         G_W_IN : positive;
+        G_H_IN : positive;
         G_C_PAR : positive;
-        G_KERNEL : positive
+        G_KERNEL : positive;
+        G_PADDING : natural;
+        G_STRIDE : positive
     );
     port (
         clk : in std_logic;
@@ -21,6 +25,7 @@ entity conv_layer is
         o_weight_ready : out std_logic;
         i_weight_data : in std_logic_vector(7 downto 0);
 
+        i_acc_ready : in std_logic;
         o_acc_valid : out std_logic;
         o_acc_data : out std_logic_vector(G_C_PAR * 32 - 1 downto 0)    
     );
@@ -40,14 +45,19 @@ architecture rtl of conv_layer is
     signal state : conv_states := S_IDLE;
 
     constant C_LINE_SIZE : positive := G_W_IN * G_C_IN;
-    constant C_INITIAL_FILL_SIZE : positive := (G_KERNEL - 1) * C_LINE_SIZE;
+    constant C_INITIAL_FILL_ROWS : positive := G_KERNEL - G_PADDING - 1;
+    constant C_INITIAL_FILL_SIZE : positive := C_INITIAL_FILL_ROWS * C_LINE_SIZE;
     constant C_PRIME_FILL_SIZE : positive := G_KERNEL * G_C_IN;
     constant C_KERNEL_SIZE : positive := G_KERNEL * G_KERNEL;
     constant C_WEIGHT_FILL_SIZE : positive := G_C_PAR * C_KERNEL_SIZE;
-    constant C_OUTPUT_WIDTH : positive := G_W_IN - G_KERNEL + 1;
+    constant C_PADDED_WIDTH : positive := G_W_IN + 2 * G_PADDING;
+    constant C_PADDED_HEIGHT : positive := G_H_IN + 2 * G_PADDING;
+
+    constant C_OUTPUT_WIDTH : positive := ((C_PADDED_WIDTH - G_KERNEL) / G_STRIDE) + 1;
+    constant C_OUTPUT_HEIGHT : positive := ((C_PADDED_HEIGHT - G_KERNEL) / G_STRIDE) + 1;
+    constant C_OUTPUT_GROUPS : positive := G_C_OUT / G_C_PAR;
     constant C_STREAM_FILL_SIZE : positive := (G_W_IN - G_KERNEL) * G_C_IN;
     
-
     type t_weight_buffer is array(
         0 to C_WEIGHT_FILL_SIZE - 1
     ) of signed(7 downto 0);
@@ -60,6 +70,14 @@ architecture rtl of conv_layer is
     type t_accumulator_array is array (
         0 to G_C_PAR - 1
     ) of signed(31 downto 0);
+
+    type t_row_map is array (
+        0 to G_KERNEL - 1
+    ) of natural range 0 to G_KERNEL;
+
+    type t_row_valid is array(
+        0 to G_KERNEL - 1
+    ) of std_logic;
 
     signal weight_buffer : t_weight_buffer;
     signal accumulators : t_accumulator_array;
@@ -107,17 +125,29 @@ architecture rtl of conv_layer is
     signal stream_bytes_available : natural range 0 to C_STREAM_FILL_SIZE := 0;
     signal window_column_count : natural range 0 to C_OUTPUT_WIDTH - 1 := 0; 
     signal next_window_pending : std_logic := '0';
-    signal calculation_result_valid : std_logic := '0';
+    signal row_map : t_row_map;
+    signal spare_row : natural range 0 to G_KERNEL := G_KERNEL;
+    signal output_row_count : natural range 0 to C_OUTPUT_HEIGHT - 1 := 0;
+    signal start_line_rotation : std_logic;
+    signal line_rotation_done : std_logic := '0';
+    signal line_rotation_has_next : std_logic := '0';
+    signal result_buffer : t_accumulator_array;
+    signal result_pending : std_logic := '0';
+
+    signal row_valid : t_row_valid := (others => '0');
+    signal output_group_count : natural range 0 to C_OUTPUT_GROUPS - 1 := 0;
+    signal logical_top_row : integer range -integer(G_PADDING) to G_H_IN + integer(G_PADDING) := -integer(G_PADDING);
+    signal vertical_advance_remaining : natural range 0 to G_STRIDE - 1 := 0;
 
 begin
-
-    assert G_W_IN > G_KERNEL report "conv_layer currenlty requires G_W_IN > G_KERNEL" severity failure;
-
     start_line_fill   <= '1' when state = S_IDLE else '0';
-    start_weight_fill <= '1' when state = S_IDLE or weight_refill_request = '1' else '0';
+    start_weight_fill <= '1' when state = S_IDLE or weight_refill_request = '1' or (line_rotation_done = '1' and line_rotation_has_next = '1' and vertical_advance_remaining = 0 and (G_C_IN > 1 or C_OUTPUT_GROUPS > 1)) else '0';
 
-    start_prime_k_line <= initial_line_fill_done;
-    start_stream_line_fill <= '1' when state = S_PRIME_K_LINE and first_window_ready = '1' and weight_group_ready = '1' else '0';
+    start_prime_k_line <= initial_line_fill_done or (line_rotation_done and line_rotation_has_next);
+
+    start_line_rotation <= '1' when state = S_STREAM_LINE_FILLING and stream_line_fill_done = '1' else '0';
+
+    start_stream_line_fill <= '1' when state = S_PRIME_K_LINE and first_window_ready = '1' and (vertical_advance_remaining > 0 or weight_group_ready = '1') else '0';
 
     i_ready <= initial_fill_active or prime_k_line_active or stream_line_fill_active;
 
@@ -125,17 +155,17 @@ begin
 
     line_buffer_we <= activation_accepted;
 
-    line_buffer_wr_row <= initial_fill_count / C_LINE_SIZE when initial_fill_active = '1' else G_KERNEL - 1;
+    line_buffer_wr_row <= G_PADDING + initial_fill_count / C_LINE_SIZE when initial_fill_active = '1' else row_map(G_KERNEL-1);
 
     line_buffer_wr_addr <= initial_fill_count mod C_LINE_SIZE when initial_fill_active = '1' else prime_fill_count when prime_k_line_active = '1' else C_PRIME_FILL_SIZE + stream_fill_count;
 
     o_weight_ready <= weight_fill_active;
     weight_accepted <= i_weight_valid and weight_fill_active;
-    o_acc_valid <= calculation_result_valid;
+    o_acc_valid <= result_pending;
 
     accumulator_output_generate : 
     for lane in 0 to G_C_PAR - 1 generate
-        o_acc_data((lane + 1) * 32 - 1 downto lane * 32) <= std_logic_vector(accumulators(lane));
+        o_acc_data((lane + 1) * 32 - 1 downto lane * 32) <= std_logic_vector(result_buffer(lane));
     end generate;
 
     controller_process : process(clk)
@@ -156,8 +186,12 @@ begin
                         end if;
 
                     when S_PRIME_K_LINE =>
-                        if first_window_ready = '1' and weight_group_ready = '1' then 
-                            state <= S_CALC_AND_SLIDING_WINDOW;
+                        if first_window_ready = '1' then
+                            if vertical_advance_remaining > 0 then
+                                state <= S_STREAM_LINE_FILLING;
+                            elsif weight_group_ready = '1' then
+                                state <= S_CALC_AND_SLIDING_WINDOW;
+                            end if;
                         end if;
 
                     when S_CALC_AND_SLIDING_WINDOW =>
@@ -171,8 +205,11 @@ begin
                         end if;
 
                     when S_LINE_ROTATION =>
-                        null;
-
+                        if line_rotation_done = '1' then
+                            if line_rotation_has_next = '1' then 
+                                state <= S_PRIME_K_LINE;
+                            end if;
+                        end if;
                 end case;
             end if;
         end if;
@@ -220,9 +257,14 @@ begin
 
             else
                 if start_prime_k_line = '1' then
-                    prime_k_line_active <= '1';
-                    first_window_ready <= '0';
                     prime_fill_count <= 0;
+                    if row_valid(G_KERNEL - 1) = '1' then
+                        prime_k_line_active <= '1';
+                        first_window_ready <= '0';
+                    else
+                        prime_k_line_active <= '0';
+                        first_window_ready <= '1';
+                    end if;
 
                 elsif prime_k_line_active = '1' then
                     if activation_accepted = '1' then
@@ -290,6 +332,9 @@ begin
         
         variable v_activation : signed(8 downto 0);
         variable v_product : signed(16 downto 0);
+        variable v_input_col : integer;
+        variable v_required_extra_columns : integer;
+        variable v_required_stream_bytes : natural;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then 
@@ -299,15 +344,17 @@ begin
                 calculation_kernel_count <= 0;
                 calculation_channel_count <= 0;
                 weight_refill_request <= '0';
-                calculation_result_valid <= '0';
+                result_pending <= '0';
                 next_window_pending <= '0';
                 window_column_count <= 0;
+                output_group_count <= 0;
+
                 for lane in 0 to G_C_PAR - 1 loop 
                     accumulators(lane) <= (others => '0');
+                    result_buffer(lane) <= (others => '0');
                 end loop;
             else
                 weight_refill_request <= '0';
-                calculation_result_valid <= '0';
 
                 if state /= S_CALC_AND_SLIDING_WINDOW Then
                     calculation_active <= '0';
@@ -317,9 +364,45 @@ begin
                     calculation_channel_count <= 0;
                     next_window_pending <= '0';
                     window_column_count <= 0;
+                    output_group_count <= 0;
+                    result_pending <= '0';
                 elsif  calculation_done = '0' then
-                    if next_window_pending = '1' then 
-                        if stream_bytes_available >= window_column_count * G_C_IN then
+                    if result_pending = '1' then
+                        if i_acc_ready = '1' then
+                            result_pending <= '0';
+
+                            if window_column_count < C_OUTPUT_WIDTH - 1 then
+                                window_column_count <= window_column_count + 1;
+                                next_window_pending <= '1';
+                            elsif output_group_count < C_OUTPUT_GROUPS -1 then
+                                output_group_count <= output_group_count + 1;
+                                window_column_count <= 0;
+                                calculation_active <= '0';
+                                calculation_kernel_count <= 0;
+                                calculation_channel_count <= 0;
+                                calculation_waiting_for_weights <= '1';
+                                weight_refill_request <= '1';
+
+                                for lane in 0 to G_C_PAR - 1 loop
+                                    accumulators(lane) <= (others => '0');
+                                end loop;
+                            else
+                                calculation_active <= '0';
+                                calculation_done <= '1';
+                            end if;
+                        end if;
+                    elsif next_window_pending = '1' then 
+                        v_required_extra_columns := integer(window_column_count) * G_STRIDE - G_PADDING;
+                        if v_required_extra_columns < 0 then
+                            v_required_extra_columns := 0;
+
+                        elsif v_required_extra_columns > G_W_IN - G_KERNEL then
+                            v_required_extra_columns := G_W_IN - G_KERNEL;
+                        end if;
+
+                        v_required_stream_bytes := natural(v_required_extra_columns) * G_C_IN;
+
+                        if stream_bytes_available >= v_required_stream_bytes then
                             next_window_pending <= '0';
                             calculation_kernel_count <= 0;
                             calculation_channel_count <= 0;
@@ -354,14 +437,20 @@ begin
                         v_row := calculation_kernel_count / G_KERNEL;
                         v_col := calculation_kernel_count mod G_KERNEL; 
 
-                        v_line_addr := (window_column_count + v_col) * G_C_IN + calculation_channel_count;
-
-                        v_activation := signed('0' & line_buffer(v_row,v_line_addr));
+                        v_input_col := integer(window_column_count) * G_STRIDE + integer(v_col) - G_PADDING;
+                        v_activation := (others => '0');
+                        if row_valid(v_row) = '1' and v_input_col >= 0 and v_input_col < G_W_IN then
+                            v_line_addr := natural(v_input_col) * G_C_IN + calculation_channel_count;
+                            v_activation := signed('0' & line_buffer(row_map(v_row),v_line_addr));
+                        end if;
 
                         for lane in 0 to G_C_PAR - 1 loop
                             v_weight_addr := lane * C_KERNEL_SIZE + calculation_kernel_count;
                             v_product := v_activation * weight_buffer(v_weight_addr);
                             accumulators(lane)<=accumulators(lane) + resize(v_product, 32);
+                            if calculation_kernel_count = C_KERNEL_SIZE - 1 and calculation_channel_count = G_C_IN - 1 then
+                                result_buffer(lane) <= accumulators(lane) + resize(v_product, 32);
+                            end if;
                         end loop;
 
                         if calculation_kernel_count = C_KERNEL_SIZE - 1 then
@@ -369,14 +458,7 @@ begin
 
                             if calculation_channel_count = G_C_IN -1 then
                                 calculation_active <= '0';
-                                calculation_result_valid <= '1';
-
-                                if window_column_count = C_OUTPUT_WIDTH - 1 then
-                                    calculation_done <= '1';
-                                else
-                                    window_column_count <= window_column_count + 1;
-                                    next_window_pending <= '1';
-                                end if;
+                                result_pending <= '1';
                             else
                                 calculation_active <= '0';
                                 calculation_channel_count <= calculation_channel_count + 1;
@@ -402,10 +484,16 @@ begin
                 stream_bytes_available <= 0;
             else
                 if start_stream_line_fill = '1' then
-                    stream_line_fill_active <= '1';
-                    stream_line_fill_done <= '0';
                     stream_fill_count <= 0;
-                    stream_bytes_available <= 0;
+                    if row_valid(G_KERNEL - 1) = '1' then
+                        stream_line_fill_active <= '1';
+                        stream_line_fill_done <= '0';
+                        stream_bytes_available <= 0;
+                    else
+                        stream_line_fill_active <= '0';
+                        stream_line_fill_done <= '1';
+                        stream_bytes_available <= C_STREAM_FILL_SIZE;
+                    end if;
                 elsif stream_line_fill_active = '1' then 
                     if activation_accepted = '1' then 
                         stream_bytes_available <= stream_bytes_available + 1;
@@ -416,6 +504,78 @@ begin
                             stream_fill_count <= stream_fill_count + 1;
                         end if;
                     end if;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    line_rotation_process : process(clk)
+        variable v_new_input_row : integer;
+    begin
+        if rising_edge(clk) then
+            if rst_n = '0' then
+                spare_row <= G_KERNEL;
+                output_row_count <= 0;
+
+                logical_top_row <= -integer(G_PADDING);
+
+                vertical_advance_remaining <= 0;
+
+                line_rotation_done <= '0';
+                line_rotation_has_next <= '0';
+
+                for row in 0 to G_KERNEL - 1 loop
+                    row_map(row) <= row;
+
+                    if integer(row) - integer(G_PADDING) >= 0 and integer(row) - integer(G_PADDING) < G_H_IN then
+                        row_valid(row) <= '1';
+                    else
+                        row_valid(row) <= '0';
+                    end if;
+                end loop;
+
+            else
+                line_rotation_done <= '0';
+                if start_line_rotation = '1' then
+                    if output_row_count < C_OUTPUT_HEIGHT - 1 then
+                        v_new_input_row := logical_top_row + G_KERNEL;
+                        for row in 0 to G_KERNEL - 2 loop
+                            row_map(row) <= row_map(row + 1);
+                            row_valid(row) <= row_valid(row + 1);
+                        end loop;
+
+                        row_map(G_KERNEL - 1) <= spare_row;
+                        spare_row <= row_map(0);
+
+                        if v_new_input_row >= 0 and v_new_input_row < G_H_IN then
+                            row_valid(G_KERNEL - 1) <= '1';
+                        else
+                            row_valid(G_KERNEL - 1) <= '0';
+                        end if;
+
+                        logical_top_row <= logical_top_row + 1;
+
+                        if vertical_advance_remaining = 0 then
+                            if G_STRIDE = 1 then
+                                output_row_count <= output_row_count + 1;
+                                vertical_advance_remaining <= 0;
+                            else
+                                vertical_advance_remaining <= G_STRIDE - 1;
+                            end if;
+
+                        elsif vertical_advance_remaining = 1 then
+                            vertical_advance_remaining <= 0;
+                            output_row_count <= output_row_count + 1;
+                        else
+                            vertical_advance_remaining <= vertical_advance_remaining - 1;
+                        end if;
+
+                        line_rotation_has_next <= '1';
+                    else
+                        line_rotation_has_next <= '0';
+                    end if;
+
+                    line_rotation_done <= '1';
                 end if;
             end if;
         end if;
